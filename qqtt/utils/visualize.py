@@ -1,3 +1,10 @@
+import os
+# Set environment variables for headless mode before importing Open3D
+# This must be done before importing open3d
+if 'DISPLAY' not in os.environ or os.environ.get('DISPLAY') == '':
+    os.environ['PYGLET_HEADLESS'] = '1'
+    os.environ['DISPLAY'] = ''
+
 import open3d as o3d
 import numpy as np
 import torch
@@ -67,8 +74,28 @@ def visualize_pc(
             )
 
     # The pcs is a 4d pcd numpy array with shape (n_frames, n_points, 3)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=visualize, width=width, height=height)
+    # Check if we're in headless mode
+    is_headless = 'DISPLAY' not in os.environ or os.environ.get('DISPLAY') == ''
+    
+    # Try to create visualizer, but fail gracefully in headless mode
+    vis = None
+    try:
+        if save_video and is_headless:
+            # Use offscreen rendering for headless environments
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False, width=width, height=height)
+        else:
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=visualize, width=width, height=height)
+    except Exception as e:
+        # In headless mode, visualization is not available
+        if is_headless or save_video:
+            raise RuntimeError(
+                f"Failed to create visualization window in headless mode: {e}. "
+                f"Visualization is not available. Please run with --skip_visualization or install OSMesa."
+            )
+        else:
+            raise RuntimeError(f"Failed to create visualization window: {e}")
 
     if save_video and visualize:
         raise ValueError("Cannot save video and visualize at the same time.")
@@ -109,17 +136,22 @@ def visualize_pc(
                     controller_meshes.append(controller_mesh)
                     vis.add_geometry(controller_meshes[-1])
                     prev_center.append(origin)
-            # Adjust the viewpoint
+            # Adjust the viewpoint (only if view_control is available)
             view_control = vis.get_view_control()
-            camera_params = o3d.camera.PinholeCameraParameters()
-            intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
-                width, height, intrinsic
-            )
-            camera_params.intrinsic = intrinsic_parameter
-            camera_params.extrinsic = w2c
-            view_control.convert_from_pinhole_camera_parameters(
-                camera_params, allow_arbitrary=True
-            )
+            if view_control is not None:
+                camera_params = o3d.camera.PinholeCameraParameters()
+                intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
+                    width, height, intrinsic
+                )
+                camera_params.intrinsic = intrinsic_parameter
+                camera_params.extrinsic = w2c
+                try:
+                    view_control.convert_from_pinhole_camera_parameters(
+                        camera_params, allow_arbitrary=True
+                    )
+                except Exception as e:
+                    # In headless mode, this may fail, but we can continue
+                    print(f"Warning: Failed to set camera parameters: {e}")
         else:
             render_object_pcd.points = o3d.utility.Vector3dVector(object_pcd.points)
             render_object_pcd.colors = o3d.utility.Vector3dVector(object_pcd.colors)
@@ -135,8 +167,14 @@ def visualize_pc(
 
         # Capture frame and write to video file if save_video is True
         if save_video:
-            frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-            frame = (frame * 255).astype(np.uint8)
+            try:
+                frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                frame = (frame * 255).astype(np.uint8)
+            except Exception as e:
+                # In headless mode, capture may fail
+                # Create a black frame as fallback
+                print(f"Warning: Failed to capture frame {i}: {e}. Using black frame.")
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
             if cfg.overlay_path is not None:
                 # Get the mask where the pixel is white
                 mask = np.all(frame == [255, 255, 255], axis=-1)
