@@ -62,24 +62,38 @@ if not cfg.use_graph:
     wp.config.verify_autograd_array_access = True
 
 # Import shared kernels from spring_mass_warp
+# XPBD系统复用mass-spring系统的辅助kernel，避免重复实现
 from .spring_mass_warp import (
-    copy_vec3,
-    copy_int,
-    copy_float,
-    set_control_points,
-    loop,
-    update_potential_collision,
-    object_collision,
-    integrate_ground_collision,
-    compute_distances,
-    compute_neigh_indices,
-    compute_chamfer_loss,
-    compute_track_loss,
-    compute_acc_loss,
-    compute_final_loss,
-    compute_simple_loss,
-    set_int,
-    update_acc,
+    # 数据复制kernel（enable_backward=False，不需要梯度）
+    copy_vec3,          # 复制vec3数组（用于复制位置、速度等3D向量）
+    copy_int,           # 复制int32数组（用于复制可见性、mask等整数数据）
+    copy_float,         # 复制float32数组（用于复制参数值）
+    
+    # 控制点管理
+    set_control_points, # 在子步之间插值控制点位置（用于驱动物体运动）
+    
+    # 循环辅助（用于碰撞检测）
+    loop,               # 循环辅助函数（用于遍历碰撞对）
+    
+    # 碰撞检测和处理
+    update_potential_collision,  # 使用空间哈希查找潜在碰撞对（离散操作，不可微）
+    object_collision,            # 处理对象间碰撞（可微分，支持弹性/摩擦参数优化）
+    integrate_ground_collision,  # 处理地面碰撞并更新位置/速度（可微分）
+    
+    # 损失计算辅助（enable_backward=False，离散操作）
+    compute_distances,      # 计算预测点与真实点的距离矩阵（用于Chamfer loss）
+    compute_neigh_indices,   # 查找最近邻索引（离散操作，不可微）
+    
+    # 损失计算kernel（可微分，用于反向传播）
+    compute_chamfer_loss,   # 计算Chamfer距离损失（预测点云与真实点云的匹配误差）
+    compute_track_loss,     # 计算跟踪损失（Smooth L1，跟踪点的位置误差）
+    compute_acc_loss,       # 计算加速度损失（Smooth L1，加速度平滑性约束）
+    compute_final_loss,     # 合并所有损失：loss = chamfer_loss + track_loss + acc_loss
+    compute_simple_loss,     # 简单损失（用于synthetic数据，L2距离）
+    
+    # 辅助工具
+    set_int,    # 设置整数标量（用于设置标志位）
+    update_acc, # 更新加速度（计算速度差，用于acc_loss）
 )
 
 

@@ -85,8 +85,8 @@ def visualize_pc(
             vis = o3d.visualization.Visualizer()
             vis.create_window(visible=False, width=width, height=height)
         else:
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(visible=visualize, width=width, height=height)
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(visible=visualize, width=width, height=height)
     except Exception as e:
         # In headless mode, visualization is not available
         if is_headless or save_video:
@@ -139,16 +139,16 @@ def visualize_pc(
             # Adjust the viewpoint (only if view_control is available)
             view_control = vis.get_view_control()
             if view_control is not None:
-                camera_params = o3d.camera.PinholeCameraParameters()
-                intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
-                    width, height, intrinsic
-                )
-                camera_params.intrinsic = intrinsic_parameter
-                camera_params.extrinsic = w2c
+            camera_params = o3d.camera.PinholeCameraParameters()
+            intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
+                width, height, intrinsic
+            )
+            camera_params.intrinsic = intrinsic_parameter
+            camera_params.extrinsic = w2c
                 try:
-                    view_control.convert_from_pinhole_camera_parameters(
-                        camera_params, allow_arbitrary=True
-                    )
+            view_control.convert_from_pinhole_camera_parameters(
+                camera_params, allow_arbitrary=True
+            )
                 except Exception as e:
                     # In headless mode, this may fail, but we can continue
                     print(f"Warning: Failed to set camera parameters: {e}")
@@ -168,8 +168,8 @@ def visualize_pc(
         # Capture frame and write to video file if save_video is True
         if save_video:
             try:
-                frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-                frame = (frame * 255).astype(np.uint8)
+            frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+            frame = (frame * 255).astype(np.uint8)
             except Exception as e:
                 # In headless mode, capture may fail
                 # Create a black frame as fallback
