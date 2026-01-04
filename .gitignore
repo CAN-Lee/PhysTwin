@@ -212,4 +212,4 @@ cython_debug/
 !assets/Picture2.png
 
 # Gradio cache
-.gradio/
+.gradio/third_module/omniphysgs/

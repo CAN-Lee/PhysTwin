@@ -3,6 +3,7 @@ from qqtt.utils import logger, visualize_pc, cfg
 from qqtt.model.diff_simulator import (
     SpringMassSystemWarp,
 )
+from qqtt.model.physics_net import PhysicsNet
 import open3d as o3d
 import numpy as np
 import torch
@@ -160,14 +161,52 @@ class InvPhyTrainerWarp:
             self_collision=cfg.self_collision,
         )
 
+        # Initialize PhysicsNet
+        # We need to extract features from the Gaussian Model if possible
+        # For now, we'll try to load the GS model from the data path to get features
+        # Assuming standard directory structure for GS output
+        try:
+            gs_ply_path = os.path.join(data_path, "point_cloud", "iteration_30000", "point_cloud.ply")
+            if not os.path.exists(gs_ply_path):
+                 # Try searching recursively or fallback
+                 gs_ply_path = None
+                 for root, dirs, files in os.walk(data_path):
+                     if "point_cloud.ply" in files:
+                         gs_ply_path = os.path.join(root, "point_cloud.ply")
+                         break
+            
+            if gs_ply_path:
+                logger.info(f"Loading GS features from {gs_ply_path} for PhysicsNet")
+                temp_gs = GaussianModel(sh_degree=3)
+                temp_gs.load_ply(gs_ply_path)
+                # Need to apply same filtering as in dataset loading if any?
+                # Assuming object_points aligns with loaded GS or is a subset.
+                # If alignment is risky, we might just use Position as input for now.
+                # Let's use Position (3) + Color (3) as minimal features which are available in dataset
+                self.use_gs_feats = False
+            else:
+                self.use_gs_feats = False
+        except Exception as e:
+            logger.warning(f"Could not load GS features: {e}")
+            self.use_gs_feats = False
+
+        # Input dim: Pos(3) + Color(3) = 6
+        # If we had full GS feats: Pos(3) + Opacity(1) + Scale(3) + Rot(4) + SH(3) = 14
+        self.physics_net = PhysicsNet(
+            in_channels=6, # Pos + RGB
+            hidden_dim=128,
+            num_experts=3
+        ).to(self.simulator.device)
+
         if not pure_inference_mode:
             self.optimizer = torch.optim.Adam(
                 [
-                    wp.to_torch(self.simulator.wp_spring_Y),
-                    wp.to_torch(self.simulator.wp_collide_elas),
-                    wp.to_torch(self.simulator.wp_collide_fric),
-                    wp.to_torch(self.simulator.wp_collide_object_elas),
-                    wp.to_torch(self.simulator.wp_collide_object_fric),
+                    {"params": self.physics_net.parameters(), "lr": cfg.base_lr}, # Add PhysicsNet params
+                    {"params": [wp.to_torch(self.simulator.wp_spring_Y)], "lr": cfg.base_lr},
+                    {"params": [wp.to_torch(self.simulator.wp_collide_elas)], "lr": cfg.base_lr},
+                    {"params": [wp.to_torch(self.simulator.wp_collide_fric)], "lr": cfg.base_lr},
+                    {"params": [wp.to_torch(self.simulator.wp_collide_object_elas)], "lr": cfg.base_lr},
+                    {"params": [wp.to_torch(self.simulator.wp_collide_object_fric)], "lr": cfg.base_lr},
                 ],
                 lr=cfg.base_lr,
                 betas=(0.9, 0.99),
@@ -325,6 +364,39 @@ class InvPhyTrainerWarp:
             if cfg.data_type == "real":
                 total_chamfer_loss = 0.0
                 total_track_loss = 0.0
+            
+            # --- PhysicsNet Forward Pass ---
+            # 1. Prepare Inputs
+            # Using current object points and colors
+            # object_points shape: (N, 3), object_colors shape: (N, 3)
+            # Need to reshape to (Batch=1, N, C)
+            pn_pos = self.object_points[0].unsqueeze(0).to(cfg.device) # Use first frame as rest shape? or current?
+            # Using initial shape is better for constitutive properties (Lagrangian)
+            pn_colors = self.object_colors[0].unsqueeze(0).to(cfg.device) if self.object_colors is not None else torch.zeros_like(pn_pos)
+            pn_features = torch.cat([pn_pos, pn_colors], dim=-1) # (1, N, 6)
+            
+            # 2. Predict Particle Weights
+            # particle_weights: (1, N, 3)
+            particle_weights = self.physics_net(pn_pos, pn_features)
+            particle_weights = particle_weights.squeeze(0) # (N, 3)
+            
+            # 3. Map to Springs (Average of endpoints)
+            # self.init_springs: Tensor (N_springs, 2)
+            # Need to ensure springs are torch tensor on device
+            spring_indices = self.init_springs.long() # Make sure it's long
+            
+            # Gather weights for both ends of each spring
+            # w_i: (N_springs, 3), w_j: (N_springs, 3)
+            w_i = particle_weights[spring_indices[:, 0]]
+            w_j = particle_weights[spring_indices[:, 1]]
+            
+            # Average
+            spring_weights = (w_i + w_j) / 2.0
+            
+            # 4. Set to Simulator
+            self.simulator.set_model_weights(spring_weights)
+            # -------------------------------
+
             self.simulator.set_init_state(
                 self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
             )
@@ -478,6 +550,22 @@ class InvPhyTrainerWarp:
             collide_object_elas = checkpoint["collide_object_elas"]
             collide_object_fric = checkpoint["collide_object_fric"]
             num_object_springs = checkpoint["num_object_springs"]
+            
+            if "physics_net" in checkpoint:
+                self.physics_net.load_state_dict(checkpoint["physics_net"])
+                logger.info("Loaded PhysicsNet from checkpoint")
+                
+                # Run forward pass to set weights for inference
+                pn_pos = self.object_points[0].unsqueeze(0).to(cfg.device)
+                pn_colors = self.object_colors[0].unsqueeze(0).to(cfg.device) if self.object_colors is not None else torch.zeros_like(pn_pos)
+                pn_features = torch.cat([pn_pos, pn_colors], dim=-1)
+                with torch.no_grad():
+                    particle_weights = self.physics_net(pn_pos, pn_features).squeeze(0)
+                    spring_indices = self.init_springs.long()
+                    w_i = particle_weights[spring_indices[:, 0]]
+                    w_j = particle_weights[spring_indices[:, 1]]
+                    spring_weights = (w_i + w_j) / 2.0
+                    self.simulator.set_model_weights(spring_weights)
 
             assert (
                 len(spring_Y) == self.simulator.n_springs

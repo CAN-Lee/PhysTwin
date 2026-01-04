@@ -138,6 +138,95 @@ def eval_springs(
 
 
 @wp.kernel
+def eval_springs_moe(
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    control_x: wp.array(dtype=wp.vec3),
+    control_v: wp.array(dtype=wp.vec3),
+    num_object_points: int,
+    springs: wp.array(dtype=wp.vec2i),
+    rest_lengths: wp.array(dtype=float),
+    spring_Y: wp.array(dtype=float),
+    model_weights: wp.array(dtype=wp.vec3),
+    dashpot_damping: float,
+    spring_Y_min: float,
+    spring_Y_max: float,
+    f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    if wp.exp(spring_Y[tid]) > spring_Y_min:
+
+        idx1 = springs[tid][0]
+        idx2 = springs[tid][1]
+
+        if idx1 >= num_object_points:
+            x1 = control_x[idx1 - num_object_points]
+            v1 = control_v[idx1 - num_object_points]
+        else:
+            x1 = x[idx1]
+            v1 = v[idx1]
+        if idx2 >= num_object_points:
+            x2 = control_x[idx2 - num_object_points]
+            v2 = control_v[idx2 - num_object_points]
+        else:
+            x2 = x[idx2]
+            v2 = v[idx2]
+
+        rest = rest_lengths[tid]
+
+        dis = x2 - x1
+        dis_len = wp.length(dis)
+
+        d = dis / wp.max(dis_len, 1e-6)
+        
+        k = wp.clamp(wp.exp(spring_Y[tid]), low=spring_Y_min, high=spring_Y_max)
+        weights = model_weights[tid]
+
+        # Expert 0: Linear Spring (Standard Hooke's Law)
+        # F = k * (l/l0 - 1)
+        strain_linear = (dis_len / rest - 1.0)
+        force_linear = k * strain_linear * d
+
+        # Expert 1: StVK-like (1D Approximation)
+        # Simulates stiffer materials / cloth
+        # Strain energy E ~ (l^2 - l0^2)^2
+        # Force F ~ k * (l^2/l0^2 - 1) * (l/l0)
+        # Note: This grows cubically with distance, providing strong resistance to stretching
+        ratio = dis_len / rest
+        strain_stvk = (ratio * ratio - 1.0) * ratio
+        force_stvk = k * strain_stvk * d
+
+        # Expert 2: Neo-Hookean-like (1D Approximation)
+        # Simulates volume-preserving materials (rubber/sponge)
+        # Force F ~ k * (l/l0 - (l0/l)^2)
+        # Note: The (l0/l)^2 term provides infinite repulsion as l->0 (volume preservation)
+        # Clamp dis_len to avoid division by zero
+        l_safe = wp.max(dis_len, 1e-6)
+        ratio_inv = rest / l_safe
+        strain_neo = (dis_len / rest - ratio_inv * ratio_inv)
+        force_neo = k * strain_neo * d
+
+        # Weighted Sum of Experts
+        spring_force = (
+            weights[0] * force_linear + 
+            weights[1] * force_stvk + 
+            weights[2] * force_neo
+        )
+
+        v_rel = wp.dot(v2 - v1, d)
+        dashpot_forces = dashpot_damping * v_rel * d
+
+        overall_force = spring_force + dashpot_forces
+
+        if idx1 < num_object_points:
+            wp.atomic_add(f, idx1, overall_force)
+        if idx2 < num_object_points:
+            wp.atomic_sub(f, idx2, overall_force)
+
+
+
+@wp.kernel
 def update_vel_from_force(
     v: wp.array(dtype=wp.vec3),
     f: wp.array(dtype=wp.vec3),
@@ -765,6 +854,9 @@ class SpringMassSystemWarp:
             requires_grad=cfg.collision_learn,
         )
 
+        # Initialize model weights as None (will use default linear kernel)
+        self.wp_model_weights = None
+
         # Create the CUDA graph to acclerate
         if cfg.use_graph:
             if cfg.data_type == "real":
@@ -957,6 +1049,27 @@ class SpringMassSystemWarp:
                 )
 
             # Calculate the spring forces
+            if self.wp_model_weights is not None:
+                wp.launch(
+                    kernel=eval_springs_moe,
+                    dim=self.n_springs,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v,
+                        self.wp_states[i].wp_control_x,
+                        self.wp_states[i].wp_control_v,
+                        self.num_object_points,
+                        self.wp_springs,
+                        self.wp_rest_lengths,
+                        self.wp_spring_Y,
+                        self.wp_model_weights,
+                        self.dashpot_damping,
+                        self.spring_Y_min,
+                        self.spring_Y_max,
+                    ],
+                    outputs=[self.wp_states[i].wp_vertice_forces],
+                )
+            else:
             wp.launch(
                 kernel=eval_springs,
                 dim=self.n_springs,
@@ -1157,4 +1270,24 @@ class SpringMassSystemWarp:
             dim=1,
             inputs=[collide_object_fric],
             outputs=[self.wp_collide_object_fric],
+        )
+
+    def set_model_weights(self, weights):
+        """
+        Set the mixture weights for the constitutive models.
+        weights: torch.Tensor of shape (n_springs, 3)
+        """
+        # Ensure weights sum to 1? Or let the network handle it.
+        # Assuming weights are passed as a torch tensor with gradients enabled if training.
+        
+        # If weights is already a wp array, just assign? 
+        # But usually we pass torch tensors from the network.
+        
+        # We need to recreate the wp array if it's new, to connect the grad graph?
+        # Or copy if it's data.
+        
+        # Case 1: Weights come from a Neural Network (requires_grad=True)
+        # We should use wp.from_torch
+        self.wp_model_weights = wp.from_torch(
+            weights, dtype=wp.vec3, requires_grad=weights.requires_grad
         )
