@@ -114,6 +114,7 @@ def render_sets(
     remove_gaussians: bool = False,
     name: str = "dynamic",
     output_dir: str = "./gaussian_output_dynamic",
+    prediction_dir: str = "./experiments",
 ):
     with torch.no_grad():
         output_path = output_dir
@@ -136,7 +137,12 @@ def render_sets(
 
         # rollout
         exp_name = dataset.source_path.split("/")[-1]
-        ctrl_pts_path = f"./experiments/{exp_name}/inference.pkl"
+        ctrl_pts_path = f"{prediction_dir}/{exp_name}/inference.pkl"
+        if not os.path.exists(ctrl_pts_path):
+            raise FileNotFoundError(
+                f"Prediction file not found: {ctrl_pts_path}\n"
+                f"Please ensure inference.pkl exists in {prediction_dir}/{exp_name}/"
+            )
         with open(ctrl_pts_path, "rb") as f:
             ctrl_pts = pickle.load(f)  # (n_frames, n_ctrl_pts, 3) ndarray
         ctrl_pts = torch.tensor(ctrl_pts, dtype=torch.float32, device="cuda")
@@ -283,8 +289,15 @@ if __name__ == "__main__":
     parser.add_argument("--remove_gaussians", action="store_true")
     parser.add_argument("--name", default="sceneA", type=str)
     parser.add_argument("--output_dir", default="./gaussian_output_dynamic", type=str)
+    parser.add_argument(
+        "--prediction_dir",
+        type=str,
+        default="./experiments",
+        help="Directory containing prediction results (default: ./experiments). Use ./experiments_physics_net for PhysicsNet results."
+    )
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
+    print(f"Using prediction directory: {args.prediction_dir}")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
@@ -299,6 +312,7 @@ if __name__ == "__main__":
         args.remove_gaussians,
         args.name,
         args.output_dir,
+        args.prediction_dir,
     )
 
     with open("./rendering_finished_dynamic.txt", "a") as f:

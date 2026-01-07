@@ -5,9 +5,9 @@ import torch
 import csv
 import numpy as np
 import os
+import argparse
 from pytorch3d.loss import chamfer_distance
 
-prediction_dir = "./experiments"
 base_path = "./data/different_types"
 output_file = "results/final_results.csv"
 
@@ -66,6 +66,34 @@ def evaluate_prediction(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate Chamfer distance for predictions")
+    parser.add_argument(
+        "--prediction_dir",
+        type=str,
+        default="./experiments",
+        help="Directory containing prediction results (default: ./experiments). Use ./experiments_physics_net for PhysicsNet results."
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default=None,
+        help="Output CSV file path (default: results/final_results.csv or results/final_results_physics_net.csv if using experiments_physics_net)"
+    )
+    args = parser.parse_args()
+    
+    prediction_dir = args.prediction_dir
+    if args.output_file is None:
+        # Auto-generate output filename based on prediction_dir
+        if "physics_net" in prediction_dir:
+            output_file = "results/final_results_physics_net.csv"
+        else:
+            output_file = "results/final_results.csv"
+    else:
+        output_file = args.output_file
+    
+    print(f"Using prediction directory: {prediction_dir}")
+    print(f"Output file: {output_file}")
+    
     file = open(output_file, mode="w", newline="", encoding="utf-8")
     writer = csv.writer(file)
 

@@ -1,9 +1,25 @@
+import warnings
+import os
+# Suppress Warp warnings about kernels with enable_backward=False (expected for control points)
+# Must be set BEFORE importing warp to be effective
+# Use broad filter to catch all UserWarnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*enable_backward=False.*")
+warnings.filterwarnings("ignore", message=".*set_control_points.*")
+warnings.filterwarnings("ignore", message=".*Running the tape backwards.*")
+warnings.filterwarnings("ignore", message=".*may produce incorrect gradients.*")
+
 import torch
 from qqtt.utils import logger, cfg
 import warp as wp
 
 wp.init()
 wp.set_device("cuda:0")
+# Try to suppress Warp warnings via config
+try:
+    wp.config.verbose = False  # Reduce verbosity
+except:
+    pass
 if not cfg.use_graph:
     wp.config.mode = "debug"
     wp.config.verbose = True
@@ -139,23 +155,23 @@ def eval_springs(
 
 @wp.kernel
 def eval_springs_moe(
-    x: wp.array(dtype=wp.vec3),
-    v: wp.array(dtype=wp.vec3),
-    control_x: wp.array(dtype=wp.vec3),
-    control_v: wp.array(dtype=wp.vec3),
-    num_object_points: int,
-    springs: wp.array(dtype=wp.vec2i),
-    rest_lengths: wp.array(dtype=float),
-    spring_Y: wp.array(dtype=float),
-    model_weights: wp.array(dtype=wp.vec3),
-    dashpot_damping: float,
-    spring_Y_min: float,
-    spring_Y_max: float,
-    f: wp.array(dtype=wp.vec3),
+    x: wp.array(dtype=wp.vec3),  # 物体粒子的当前位置 (N_points, 3)
+    v: wp.array(dtype=wp.vec3),  # 物体粒子的当前速度 (N_points, 3)
+    control_x: wp.array(dtype=wp.vec3),  # 控制点（如手部）的当前位置 (N_control, 3)
+    control_v: wp.array(dtype=wp.vec3),  # 控制点的当前速度 (N_control, 3)
+    num_object_points: int,  # 物体粒子的数量，用于区分物体粒子和控制点
+    springs: wp.array(dtype=wp.vec2i),  # 弹簧连接索引 (N_springs, 2)，每行存储 [idx1, idx2]
+    rest_lengths: wp.array(dtype=float),  # 弹簧的静止长度 (N_springs,)，用于计算应变
+    spring_Y: wp.array(dtype=float),  # 弹簧刚度系数（对数形式）(N_springs,)，需exp()还原
+    model_weights: wp.array(dtype=wp.vec3),  # 混合专家模型权重 (N_springs, 3)，[w_linear, w_stvk, w_neo]
+    dashpot_damping: float,  # 阻尼系数，用于计算速度相关的阻尼力
+    spring_Y_min: float,  # 最小刚度阈值，低于此值的弹簧不参与计算（性能优化）
+    spring_Y_max: float,  # 最大刚度阈值，用于clamp防止数值爆炸
+    f: wp.array(dtype=wp.vec3),  # 输出：每个粒子受到的合力 (N_points, 3)，通过atomic_add累加
 ):
-    tid = wp.tid()
+    tid = wp.tid()  # 获取当前线程的索引（spring的编号）
 
-    if wp.exp(spring_Y[tid]) > spring_Y_min:
+    if wp.exp(spring_Y[tid]) > spring_Y_min:    # 仅当弹性系数(exp(spring_Y[tid]))大于最小值时，spring才参与力的计算
 
         idx1 = springs[tid][0]
         idx2 = springs[tid][1]
@@ -192,20 +208,26 @@ def eval_springs_moe(
         # Simulates stiffer materials / cloth
         # Strain energy E ~ (l^2 - l0^2)^2
         # Force F ~ k * (l^2/l0^2 - 1) * (l/l0)
-        # Note: This grows cubically with distance, providing strong resistance to stretching
+        # Normalize by dividing by rest length to match Linear's scale at small strains
         ratio = dis_len / rest
         strain_stvk = (ratio * ratio - 1.0) * ratio
-        force_stvk = k * strain_stvk * d
+        # Normalization: at small strains (ratio ≈ 1), StVK should match Linear
+        # When ratio = 1 + ε, StVK strain ≈ 3ε, Linear strain = ε
+        # So we scale StVK by 1/3 to match at small strains, but keep nonlinearity at large strains
+        force_stvk = k * strain_stvk * d / 3.0
 
         # Expert 2: Neo-Hookean-like (1D Approximation)
         # Simulates volume-preserving materials (rubber/sponge)
         # Force F ~ k * (l/l0 - (l0/l)^2)
-        # Note: The (l0/l)^2 term provides infinite repulsion as l->0 (volume preservation)
-        # Clamp dis_len to avoid division by zero
-        l_safe = wp.max(dis_len, 1e-6)
+        # Note: The (l0/l)^2 term provides strong repulsion as l->0 (volume preservation)
+        # Clamp dis_len to avoid division by zero, and normalize to prevent explosion
+        l_safe = wp.max(dis_len, 0.1 * rest)  # More conservative clamping (10% of rest length)
         ratio_inv = rest / l_safe
+        # Normalize: at equilibrium (l = l0), Neo-Hookean should match Linear (both = 0)
+        # At small compression (l = 0.9*l0), Neo strain ≈ -0.1 - 1.23 ≈ -1.33, Linear = -0.1
+        # We scale Neo by a factor to prevent it from dominating, but keep strong repulsion
         strain_neo = (dis_len / rest - ratio_inv * ratio_inv)
-        force_neo = k * strain_neo * d
+        force_neo = k * strain_neo * d * 0.1  # Scale down to prevent explosion
 
         # Weighted Sum of Experts
         spring_force = (

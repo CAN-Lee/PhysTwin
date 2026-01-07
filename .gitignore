@@ -213,3 +213,4 @@ cython_debug/
 
 # Gradio cache
 .gradio/third_module/omniphysgs/
+third_module/omniphysgs/

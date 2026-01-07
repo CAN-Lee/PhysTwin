@@ -167,13 +167,17 @@ class PhysicsNet(nn.Module):
         # For better smoothness, we could use IDW, but average is stable
         particle_logits = torch.mean(neighbor_logits, dim=2) # (B, N, E)
         
-        # Apply Gumbel Softmax (Hard for forward, Soft for backward)
-        # During inference/eval, we might want purely Hard.
+        # Apply Softmax for expert weights
+        # Strategy: Use pure softmax during training for maximum gradient flow,
+        # then use Gumbel-Softmax with hard=True for inference (discrete selection)
         if self.training:
-            weights = F.gumbel_softmax(particle_logits, tau=1.0, hard=True, dim=-1)
+            # Pure softmax: Fully differentiable, best gradient flow
+            # This ensures maximum sensitivity of loss to weight changes
+            weights = F.softmax(particle_logits, dim=-1)
         else:
-            # Standard softmax + argmax logic (or still gumbel with hard=True)
-            weights = F.gumbel_softmax(particle_logits, tau=1.0, hard=True, dim=-1)
+            # Use hard Gumbel-Softmax for inference (discrete selection)
+            # This gives interpretable "which expert" decisions at test time
+            weights = F.gumbel_softmax(particle_logits, tau=0.5, hard=True, dim=-1)
             
         return weights
 

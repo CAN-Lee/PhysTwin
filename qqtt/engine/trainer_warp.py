@@ -1,5 +1,62 @@
+import warnings
+import sys
+import io
+from contextlib import redirect_stderr
+
+# Suppress Warp warnings about set_control_points (control points don't need gradients)
+# Must be set before importing warp
+warnings.filterwarnings("ignore", category=UserWarning, module="warp")
+warnings.filterwarnings("ignore", message=".*enable_backward=False.*")
+warnings.filterwarnings("ignore", message=".*set_control_points.*")
+warnings.filterwarnings("ignore", message=".*Running the tape backwards.*")
+
+# Custom stderr filter to catch Warp warnings that bypass Python warnings
+class WarpStderrFilter:
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+    
+    def write(self, text):
+        # Filter out Warp warnings about enable_backward=False
+        # Check for various patterns that Warp might use
+        text_str = str(text) if not isinstance(text, str) else text
+        if any(keyword in text_str for keyword in [
+            "enable_backward=False",
+            "set_control_points",
+            "Running the tape backwards",
+            "may produce incorrect gradients",
+            "Warp UserWarning"
+        ]):
+            return  # Suppress this message
+        # Pass through everything else
+        self.original_stderr.write(text)
+    
+    def flush(self):
+        self.original_stderr.flush()
+    
+    def __enter__(self):
+        sys.stderr = self
+        return self
+    
+    def __exit__(self, *args):
+        sys.stderr = self.original_stderr
+
+# Also monkey-patch warnings module to catch Warp warnings
+_original_warn = warnings.warn
+def _filtered_warn(*args, **kwargs):
+    message = str(args[0]) if args else ""
+    if any(keyword in message for keyword in [
+        "enable_backward=False",
+        "set_control_points", 
+        "Running the tape backwards",
+        "may produce incorrect gradients"
+    ]):
+        return  # Suppress
+    return _original_warn(*args, **kwargs)
+warnings.warn = _filtered_warn
+
 from qqtt.data import RealData, SimpleData
 from qqtt.utils import logger, visualize_pc, cfg
+from qqtt.utils.visualize import _create_video_from_frames
 from qqtt.model.diff_simulator import (
     SpringMassSystemWarp,
 )
@@ -14,6 +71,9 @@ import warp as wp
 from scipy.spatial import KDTree
 import pickle
 import cv2
+import subprocess
+import tempfile
+import shutil
 # Optional imports for headless environments
 try:
     from pynput import keyboard
@@ -352,6 +412,18 @@ class InvPhyTrainerWarp:
             )
 
     def train(self, start_epoch=-1):
+        # [FIX] Disable graph mode when training PhysicsNet
+        # Graph is created in __init__ when wp_model_weights is None,
+        # so it doesn't include gradients for wp_model_weights.
+        # We need to use tape mode for PhysicsNet training.
+        original_use_graph = cfg.use_graph
+        if hasattr(self, 'physics_net') and self.physics_net is not None:
+            logger.info("[PhysicsNet Training] Disabling graph mode to enable gradient flow for wp_model_weights")
+            cfg.use_graph = False
+            # Recreate tape if needed (it should already exist)
+            if not hasattr(self.simulator, 'tape') or self.simulator.tape is None:
+                self.simulator.tape = wp.Tape()
+        
         # Render the initial visualization
         video_path = f"{cfg.base_dir}/train/init.mp4"
         self.visualize_sim(save_only=True, video_path=video_path)
@@ -380,21 +452,64 @@ class InvPhyTrainerWarp:
             particle_weights = self.physics_net(pn_pos, pn_features)
             particle_weights = particle_weights.squeeze(0) # (N, 3)
             
+            # [DEBUG] Retain gradient for inspection
+            particle_weights.retain_grad()
+            
             # 3. Map to Springs (Average of endpoints)
             # self.init_springs: Tensor (N_springs, 2)
-            # Need to ensure springs are torch tensor on device
+            # Only apply PhysicsNet to object-internal springs (not control point springs)
+            # Control point springs use default linear model weights [1, 0, 0]
             spring_indices = self.init_springs.long() # Make sure it's long
+            num_springs = spring_indices.shape[0]
             
-            # Gather weights for both ends of each spring
-            # w_i: (N_springs, 3), w_j: (N_springs, 3)
-            w_i = particle_weights[spring_indices[:, 0]]
-            w_j = particle_weights[spring_indices[:, 1]]
+            # Build spring_weights: control point springs use [1,0,0], object springs use PhysicsNet
+            # Only process object-internal springs (first num_object_springs)
+            object_spring_indices = spring_indices[:self.num_object_springs]
+            num_object_points = particle_weights.shape[0]
+            valid_mask = (object_spring_indices[:, 0] < num_object_points) & \
+                         (object_spring_indices[:, 1] < num_object_points)
             
-            # Average
-            spring_weights = (w_i + w_j) / 2.0
+            # Build spring_weights without inplace operations
+            # Control point springs use [1,0,0], object springs use PhysicsNet predictions
+            default_linear = torch.tensor([1.0, 0.0, 0.0], device=cfg.device, requires_grad=False).unsqueeze(0)
+            
+            if valid_mask.any():
+                # Gather weights for valid object springs (from PhysicsNet)
+                valid_indices = torch.where(valid_mask)[0]
+                valid_spring_indices = object_spring_indices[valid_indices]
+                
+                w_i = particle_weights[valid_spring_indices[:, 0]]  # (N_valid, 3)
+                w_j = particle_weights[valid_spring_indices[:, 1]]  # (N_valid, 3)
+                valid_weights = (w_i + w_j) / 2.0  # (N_valid, 3) - differentiable!
+                
+                # Build spring_weights using scatter (non-inplace version)
+                # Create a full tensor first, then use scatter to assign valid weights
+                spring_weights = default_linear.repeat(num_springs, 1).clone()
+                # Use scatter (non-inplace) to assign valid weights
+                # Create index tensor for scatter
+                indices_expanded = valid_indices.unsqueeze(1).expand(-1, 3)  # (N_valid, 3)
+                # Use scatter (creates new tensor, not inplace)
+                spring_weights = spring_weights.scatter(0, indices_expanded, valid_weights)
+            else:
+                # No valid object springs, all use linear
+                spring_weights = default_linear.repeat(num_springs, 1)
+            
+            # [DEBUG] Retain gradient for spring_weights
+            spring_weights.retain_grad()
             
             # 4. Set to Simulator
+            # [DEBUG] Check spring_weights before passing to Warp
+            if i == 0:  # Only print for first iteration
+                logger.info(f"[DEBUG] spring_weights.requires_grad: {spring_weights.requires_grad}")
+                logger.info(f"[DEBUG] spring_weights.grad_fn: {spring_weights.grad_fn}")
+                logger.info(f"[DEBUG] spring_weights.shape: {spring_weights.shape}")
+            
             self.simulator.set_model_weights(spring_weights)
+            
+            # [DEBUG] Check wp_model_weights after setting
+            if i == 0 and self.simulator.wp_model_weights is not None:
+                logger.info(f"[DEBUG] wp_model_weights type: {type(self.simulator.wp_model_weights)}")
+                logger.info(f"[DEBUG] wp_model_weights.requires_grad: {getattr(self.simulator.wp_model_weights, 'requires_grad', 'N/A')}")
             # -------------------------------
 
             self.simulator.set_init_state(
@@ -407,20 +522,129 @@ class InvPhyTrainerWarp:
                         self.simulator.update_collision_graph()
 
                     if cfg.use_graph:
+                        # Suppress Warp warnings during graph launch
+                        with WarpStderrFilter(sys.stderr):
                         wp.capture_launch(self.simulator.graph)
+                        # [Gradient Bridge] For graph mode, gradients are computed in the graph
+                        # We still need to manually propagate from Warp to PyTorch
+                        if self.simulator.wp_model_weights is not None:
+                            if j == 1:
+                                logger.info(f"[Gradient Bridge] Graph mode: checking wp_model_weights.grad...")
+                            if hasattr(self.simulator.wp_model_weights, 'grad') and self.simulator.wp_model_weights.grad is not None:
+                                    warp_grad = wp.to_torch(self.simulator.wp_model_weights.grad)
+                                    # Accumulate gradients
+                                    if spring_weights.grad is None:
+                                        spring_weights.grad = warp_grad.clone()
+                                    else:
+                                        spring_weights.grad += warp_grad
+                                    if j == 1:
+                                        logger.info(f"[Gradient Bridge] Graph mode: Warp grad norm = {warp_grad.norm().item():.6f}")
+                            elif j == 1:
+                                logger.warning(f"[Gradient Bridge] Graph mode: wp_model_weights.grad is None!")
                     else:
                         if cfg.data_type == "real":
                             with self.simulator.tape:
                                 self.simulator.step()
                                 self.simulator.calculate_loss()
+                            # Suppress Warp warnings during backward (using custom filter)
+                            with WarpStderrFilter(sys.stderr):
                             self.simulator.tape.backward(self.simulator.loss)
+                            
+                            # [Gradient Bridge] Manually propagate gradients from Warp to PyTorch
+                            # Key insight: Warp's tape.backward() computes gradients but may not automatically
+                            # write them back to PyTorch tensors. We need to manually extract and propagate.
+                            if self.simulator.wp_model_weights is not None:
+                                # After tape.backward(), check if wp_model_weights.grad exists
+                                if j == 1:
+                                    logger.info(f"[Gradient Bridge] After tape.backward(), checking wp_model_weights.grad...")
+                                
+                                # Direct access to grad attribute
+                                if hasattr(self.simulator.wp_model_weights, 'grad'):
+                                    warp_grad_array = self.simulator.wp_model_weights.grad
+                                    if warp_grad_array is not None:
+                                        # Convert Warp gradient to PyTorch tensor
+                                        warp_grad = wp.to_torch(warp_grad_array)
+                                        
+                                        if j == 1:
+                                            grad_norm = warp_grad.norm().item()
+                                            grad_max = warp_grad.abs().max().item()
+                                            grad_min = warp_grad.abs()[warp_grad.abs() > 0].min().item() if (warp_grad.abs() > 0).any() else 0.0
+                                            logger.info(f"[Gradient Bridge] Frame {j}: Found Warp grad! Norm = {grad_norm:.6f}, Max = {grad_max:.6f}, Min (non-zero) = {grad_min:.6f}")
+                                        
+                                        # Accumulate gradients instead of calling backward multiple times
+                                        # This avoids the inplace operation error
+                                        if spring_weights.grad is None:
+                                            spring_weights.grad = warp_grad.clone()
+                                        else:
+                                            spring_weights.grad += warp_grad
+                                        
+                                        if j == 1:
+                                            accumulated_norm = spring_weights.grad.norm().item() if spring_weights.grad is not None else 0
+                                            logger.info(f"[Gradient Bridge] Accumulated grad norm: {accumulated_norm:.6f}")
+                                    else:
+                                        if j == 1:
+                                            logger.warning(f"[Gradient Bridge] Frame {j}: wp_model_weights.grad exists but is None!")
+                                            logger.warning(f"[Gradient Bridge] This means Warp did not compute gradients for wp_model_weights.")
+                                            logger.warning(f"[Gradient Bridge] Possible reasons:")
+                                            logger.warning(f"  1. wp_model_weights was not used in the computation graph")
+                                            logger.warning(f"  2. Warp kernel does not support gradients for this array type")
+                                            logger.warning(f"  3. requires_grad was not properly set")
+                                else:
+                                    if j == 1:
+                                        logger.warning(f"[Gradient Bridge] wp_model_weights has no 'grad' attribute!")
+                                        logger.warning(f"[Gradient Bridge] Warp array type: {type(self.simulator.wp_model_weights)}")
+                                        logger.warning(f"[Gradient Bridge] Available attributes: {dir(self.simulator.wp_model_weights)}")
                         else:
                             with self.simulator.tape:
                                 self.simulator.step()
                                 self.simulator.calculate_simple_loss()
+                            # Suppress Warp warnings during backward (using custom filter)
+                            with WarpStderrFilter(sys.stderr):
                             self.simulator.tape.backward(self.simulator.loss)
+                            
+                            # [Gradient Bridge] Manually propagate gradients from Warp to PyTorch
+                            if self.simulator.wp_model_weights is not None:
+                                if hasattr(self.simulator.wp_model_weights, 'grad') and self.simulator.wp_model_weights.grad is not None:
+                                    warp_grad = wp.to_torch(self.simulator.wp_model_weights.grad)
+                                    # Accumulate gradients instead of calling backward multiple times
+                                    if spring_weights.grad is None:
+                                        spring_weights.grad = warp_grad.clone()
+                                    else:
+                                        spring_weights.grad += warp_grad
+                                elif j == 1:
+                                    logger.warning(f"[Gradient Bridge] Frame {j} (synthetic): wp_model_weights.grad is None!")
+                    
+                    # After all frames, propagate accumulated gradients back to PhysicsNet
+                    if j == cfg.train_frame - 1:  # Last frame
+                        if spring_weights.grad is not None:
+                            # Check accumulated gradient before backward
+                            accumulated_grad_norm = spring_weights.grad.norm().item()
+                            logger.info(f"[Gradient Bridge] Before backward: accumulated spring_weights.grad norm = {accumulated_grad_norm:.6f}")
+                            
+                            # Now call backward once with accumulated gradients
+                            spring_weights.backward(spring_weights.grad, retain_graph=False)
+                            
+                            # [DEBUG] Check gradients AFTER backward
+                            if particle_weights.grad is not None:
+                                grad_norm = particle_weights.grad.norm().item()
+                                logger.info(f"[Gradient Check] After backward: particle_weights.grad norm = {grad_norm:.6f}")
+                                logger.info(f"[Gradient Check] Max grad: {particle_weights.grad.max().item():.6f}, Min grad: {particle_weights.grad.min().item():.6f}")
+                                if grad_norm < 1e-8:
+                                    logger.warning("[Gradient Check] Gradient is VERY SMALL (<1e-8)! This may indicate:")
+                                    logger.warning("  1. Gumbel-Softmax with hard=True may have small gradients")
+                                    logger.warning("  2. Loss may not be sensitive to model_weights")
+                                    logger.warning("  3. Consider using softmax or reducing tau in Gumbel-Softmax")
+                            else:
+                                logger.warning("[Gradient Check] particle_weights.grad is None! Gradient graph broken.")
+                        else:
+                            logger.warning(f"[Gradient Bridge] Frame {j} (last): spring_weights.grad is None! No gradients accumulated.")
 
                     self.optimizer.step()
+                    self.optimizer.zero_grad() # Ensure gradients are cleared after step
+                    
+                    # Clear spring_weights.grad for next iteration (but keep the computation graph)
+                    if spring_weights.grad is not None:
+                        spring_weights.grad.zero_()
 
                     if cfg.data_type == "real":
                         chamfer_loss = wp.to_torch(
@@ -480,6 +704,9 @@ class InvPhyTrainerWarp:
             if i % cfg.vis_interval == 0 or i == cfg.iterations - 1:
                 video_path = f"{cfg.base_dir}/train/sim_iter{i}.mp4"
                 self.visualize_sim(save_only=True, video_path=video_path)
+                
+                # Only log video to wandb if file was actually created (not skipped in headless mode)
+                if os.path.exists(video_path):
                 wandb.log(
                     {
                         "video": wandb.Video(
@@ -490,6 +717,8 @@ class InvPhyTrainerWarp:
                     },
                     step=i,
                 )
+                else:
+                    logger.warning(f"Video file {video_path} not created (likely headless mode), skipping wandb log")
                 # Save the parameters
                 cur_model = {
                     "epoch": i,
@@ -509,6 +738,7 @@ class InvPhyTrainerWarp:
                     "collide_object_fric": wp.to_torch(
                         self.simulator.wp_collide_object_fric, requires_grad=False
                     ),
+                    "physics_net": self.physics_net.state_dict(),  # Save PhysicsNet state
                     "optimizer_state_dict": self.optimizer.state_dict(),
                 }
                 if best_loss == None or total_loss < best_loss:
@@ -536,6 +766,11 @@ class InvPhyTrainerWarp:
                     f"[Visualize]: Visualize the simulation at iteration {i} and save the model"
                 )
 
+        # Restore original graph mode setting
+        if hasattr(self, 'physics_net') and self.physics_net is not None:
+            cfg.use_graph = original_use_graph
+            logger.info(f"[PhysicsNet Training] Restored graph mode setting: {cfg.use_graph}")
+
         wandb.finish()
 
     def test(self, model_path=None):
@@ -562,9 +797,26 @@ class InvPhyTrainerWarp:
                 with torch.no_grad():
                     particle_weights = self.physics_net(pn_pos, pn_features).squeeze(0)
                     spring_indices = self.init_springs.long()
-                    w_i = particle_weights[spring_indices[:, 0]]
-                    w_j = particle_weights[spring_indices[:, 1]]
-                    spring_weights = (w_i + w_j) / 2.0
+                    num_springs = spring_indices.shape[0]
+                    
+                    # Initialize all springs with default linear weights [1, 0, 0]
+                    spring_weights = torch.zeros((num_springs, 3), device=cfg.device)
+                    spring_weights[:, 0] = 1.0  # Default: use linear model only
+                    
+                    # Only process object-internal springs
+                    object_spring_indices = spring_indices[:self.num_object_springs]
+                    num_object_points = particle_weights.shape[0]
+                    valid_mask = (object_spring_indices[:, 0] < num_object_points) & \
+                                 (object_spring_indices[:, 1] < num_object_points)
+                    
+                    if valid_mask.any():
+                        valid_indices = torch.where(valid_mask)[0]
+                        valid_spring_indices = object_spring_indices[valid_indices]
+                        w_i = particle_weights[valid_spring_indices[:, 0]]
+                        w_j = particle_weights[valid_spring_indices[:, 1]]
+                        valid_weights = (w_i + w_j) / 2.0
+                        spring_weights[valid_indices] = valid_weights
+                    
                     self.simulator.set_model_weights(spring_weights)
 
             assert (
@@ -588,11 +840,33 @@ class InvPhyTrainerWarp:
             video_path=video_path,
             save_trajectory=True,
             save_path=save_path,
+            skip_if_headless=False,  # Allow video generation in headless mode using ffmpeg
         )
 
     def visualize_sim(
-        self, save_only=True, video_path=None, save_trajectory=False, save_path=None
+        self, save_only=True, video_path=None, save_trajectory=False, save_path=None, skip_if_headless=True
     ):
+        # Check if we're in headless environment
+        import os
+        is_headless = False
+        if os.name == 'posix':
+            display = os.environ.get('DISPLAY')
+            if not display or display.strip() == '':
+                is_headless = True
+        
+        # In headless mode, we can still generate videos using ffmpeg offline synthesis
+        # Only skip if we're trying to visualize interactively (not saving video)
+        if is_headless and skip_if_headless:
+            if save_only and video_path:
+                # We can still generate video in headless mode using ffmpeg
+                # visualize_pc will handle headless rendering with invisible window
+                logger.info("Headless environment detected. Will use ffmpeg offline video synthesis.")
+            elif not save_only:
+                # Cannot visualize interactively in headless mode
+                logger.warning("Headless environment detected. Skipping interactive visualization.")
+                return
+            # If save_only and video_path, continue to generate video
+        
         logger.info("Visualizing the simulation")
         # Visualize the whole simulation using current set of parameters in the physical simulator
         frame_len = self.dataset.frame_len
@@ -1648,8 +1922,11 @@ class InvPhyTrainerWarp:
 
         vis = o3d.visualization.Visualizer()
         vis.create_window(visible=False, width=width, height=height)
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Codec for .mp4 file format
-        video_writer = cv2.VideoWriter(video_path, fourcc, FPS, (width, height))
+        
+        # Use ffmpeg for video synthesis - save frames to temporary directory
+        temp_frame_dir = tempfile.mkdtemp(prefix="video_frames_force_")
+        frame_paths = []
+        logger.info(f"Using ffmpeg for video synthesis. Temporary frames directory: {temp_frame_dir}")
 
         frame_path = f"{cfg.overlay_path}/{vis_cam_idx}/0.png"
         frame = cv2.imread(frame_path)
@@ -1721,9 +1998,11 @@ class InvPhyTrainerWarp:
         frame[~force_vis_mask] = force_image[~force_vis_mask]
 
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        # cv2.imshow("Interactive Playground", frame)
-        # cv2.waitKey(0)
-        video_writer.write(frame)
+        # Save frame as PNG
+        frame_filename = f"frame_{0:06d}.png"
+        frame_path = os.path.join(temp_frame_dir, frame_filename)
+        cv2.imwrite(frame_path, frame)
+        frame_paths.append(frame_path)
 
         for i in tqdm(range(1, frame_len)):
             if cfg.data_type == "real":
@@ -1850,12 +2129,30 @@ class InvPhyTrainerWarp:
             force_vis_mask = np.all(force_image == [255, 255, 255], axis=-1)
             frame[~force_vis_mask] = force_image[~force_vis_mask]
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            video_writer.write(frame)
+            # Save frame as PNG
+            frame_filename = f"frame_{i:06d}.png"
+            frame_path = os.path.join(temp_frame_dir, frame_filename)
+            cv2.imwrite(frame_path, frame)
+            frame_paths.append(frame_path)
 
             # cv2.imshow("Interactive Playground", frame)
             # cv2.waitKey(0)
         vis.destroy_window()
-        video_writer.release()
+        
+        # Use ffmpeg to combine frames into video
+        if len(frame_paths) > 0:
+            success = _create_video_from_frames(frame_paths, video_path, FPS, cleanup=True)
+            if not success:
+                logger.error("Failed to create video from frames")
+        else:
+            logger.warning("No frames captured, cannot create video.")
+        
+        # Clean up temporary frame directory
+        if temp_frame_dir and os.path.exists(temp_frame_dir):
+            try:
+                shutil.rmtree(temp_frame_dir)
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_frame_dir}: {e}")
 
     def get_force_vector(
         self, x, springs, rest_lengths, spring_Y, num_object_points, controller_points
@@ -1940,8 +2237,11 @@ class InvPhyTrainerWarp:
 
         vis = o3d.visualization.Visualizer()
         vis.create_window(visible=False, width=width, height=height)
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Codec for .mp4 file format
-        video_writer = cv2.VideoWriter(video_path, fourcc, FPS, (width, height))
+        
+        # Use ffmpeg for video synthesis - save frames to temporary directory
+        temp_frame_dir = tempfile.mkdtemp(prefix="video_frames_material_")
+        frame_paths = []
+        logger.info(f"Using ffmpeg for video synthesis. Temporary frames directory: {temp_frame_dir}")
 
         frame_path = f"{cfg.overlay_path}/{vis_cam_idx}/0.png"
         frame = cv2.imread(frame_path)
@@ -2052,9 +2352,11 @@ class InvPhyTrainerWarp:
         frame[~material_vis_mask] = material_image[~material_vis_mask]
 
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        cv2.imshow("Interactive Playground", frame)
-        cv2.waitKey(1)
-        video_writer.write(frame)
+        # Save frame as PNG
+        frame_filename = f"frame_{0:06d}.png"
+        frame_path = os.path.join(temp_frame_dir, frame_filename)
+        cv2.imwrite(frame_path, frame)
+        frame_paths.append(frame_path)
 
         for i in tqdm(range(1, frame_len)):
             if cfg.data_type == "real":
@@ -2142,12 +2444,30 @@ class InvPhyTrainerWarp:
             force_vis_mask = np.all(force_image == [255, 255, 255], axis=-1)
             frame[~force_vis_mask] = force_image[~force_vis_mask]
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            video_writer.write(frame)
+            # Save frame as PNG
+            frame_filename = f"frame_{i:06d}.png"
+            frame_path = os.path.join(temp_frame_dir, frame_filename)
+            cv2.imwrite(frame_path, frame)
+            frame_paths.append(frame_path)
 
             cv2.imshow("Interactive Playground", frame)
             cv2.waitKey(1)
         vis.destroy_window()
-        video_writer.release()
+        
+        # Use ffmpeg to combine frames into video
+        if len(frame_paths) > 0:
+            success = _create_video_from_frames(frame_paths, video_path, FPS, cleanup=True)
+            if not success:
+                logger.error("Failed to create video from frames")
+        else:
+            logger.warning("No frames captured, cannot create video.")
+        
+        # Clean up temporary frame directory
+        if temp_frame_dir and os.path.exists(temp_frame_dir):
+            try:
+                shutil.rmtree(temp_frame_dir)
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory {temp_frame_dir}: {e}")
 
 
 def get_simple_shadow(

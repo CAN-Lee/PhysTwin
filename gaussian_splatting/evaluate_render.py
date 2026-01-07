@@ -24,14 +24,44 @@ def compute_iou(mask1, mask2):
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Evaluate rendering quality for predictions")
+    parser.add_argument(
+        "--prediction_dir",
+        type=str,
+        default=None,
+        help="Directory containing prediction results (optional, used to determine output filename suffix)"
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default=None,
+        help="Output log file path (default: results/output_dynamic.txt or results/output_dynamic_physics_net.txt if using experiments_physics_net)"
+    )
+    args = parser.parse_args()
+    
     render_path = './data/render_eval_data'
     human_mask_path = "./data/different_types_human_mask"
     root_data_dir = './data/gaussian_data'
-    output_dir = './gaussian_output_dynamic'
+    
+    # Auto-detect output directory based on prediction_dir
+    if args.prediction_dir and "physics_net" in args.prediction_dir:
+        output_dir = './gaussian_output_dynamic_physics_net'
+    else:
+        output_dir = './gaussian_output_dynamic'
 
     log_dir = './results'
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, 'output_dynamic.txt')
+    
+    # Auto-generate output filename based on prediction_dir
+    if args.output_file is None:
+        if args.prediction_dir and "physics_net" in args.prediction_dir:
+            log_file_path = os.path.join(log_dir, 'output_dynamic_physics_net.txt')
+        else:
+            log_file_path = os.path.join(log_dir, 'output_dynamic.txt')
+    else:
+        log_file_path = args.output_file
 
     with open(log_file_path, 'w') as log_file:
 
@@ -49,12 +79,28 @@ if __name__ == "__main__":
             render_path_dir = os.path.join(render_path, scene)
             human_mask_dir = os.path.join(human_mask_path, scene)
 
+            # Check if GT data exists
+            if not os.path.exists(render_path_dir):
+                print(f"Skipping {scene} (GT data not found in {render_path_dir})")
+                continue
+
             # Load frame split info
             with open(f"{render_path_dir}/split.json", 'r') as f:
                 info = json.load(f)
             frame_len = info['frame_len']
             train_f_idx_range = list(range(info["train"][0] + 1, info["train"][1]))   # +1 if ignoring the first frame
             test_f_idx_range = list(range(info["test"][0], info["test"][1]))
+
+            # Check if render output exists for this scene
+            if not os.path.exists(output_scene_dir):
+                print(f"Skipping {scene} (render output directory not found: {output_scene_dir})")
+                continue
+
+            # Check if at least one render file exists (check first frame of first view)
+            first_render_file = os.path.join(output_scene_dir, "0", f"{train_f_idx_range[0]:05d}.png")
+            if not os.path.exists(first_render_file):
+                print(f"Skipping {scene} (render files not found in {output_scene_dir}, expected file: {first_render_file})")
+                continue
 
             print("train indices range from", train_f_idx_range[0], "to", train_f_idx_range[-1])
             print("test indices range from", test_f_idx_range[0], "to", test_f_idx_range[-1])
@@ -200,8 +246,8 @@ if __name__ == "__main__":
         log_file.write(f"{'PSNR-test':<12} | {'SSIM-test':<12} | {'LPIPS-test':<14} | {'IoU-test':<12}\n")
         log_file.write("-" * 160 + "\n")
         
-        # Scene rows
-        for scene in scene_name:
+        # Scene rows - only iterate over scenes that were actually processed
+        for scene in scene_metrics.keys():
             metrics = scene_metrics[scene]
             log_file.write(f"{scene[:50]:<50} | ")
             log_file.write(f"{metrics['psnr_train']:<12.6f} | ")
