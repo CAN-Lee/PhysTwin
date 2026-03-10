@@ -1,0 +1,90 @@
+# Rope Specific Config (Wide Grip)
+output_dir: './output_2/phys_expert_rope3'
+tag: 'rope_lift_wide'
+
+# Target Scenes Filter
+target_scenes:
+ - "single_lift_rope"
+
+data:
+  root: './data/different_types'
+  reverse_z: true
+
+
+train:
+  lr_params: 1e-3
+  iters: 20
+  batch_size: 1
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05
+
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 2e-5           # [STABILITY] Reduced time step
+  grid_res: 14       
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  # Judged for Rope: Fiber (fi) for tensile, NH for volume/cross-section maintenance.
+  init_weights: [0.4, 0.1, 0.1, 0.4]
+
+  svd_clamp_max: 3.0 # [REVISED] Relaxed to allow enough restorative force for cross-section
+  
+  gravity: [0.0, 0.0, -9.8] 
+  damping: 50.0      # [STABILITY] Extreme damping for sparse rope
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: -1.0        
+  init_raw_nu: 1.0        # [CRITICAL] Higher nu (closer to 0.5) helps maintain cross-section shape
+  init_raw_fiber_k: 4.0   
+  init_raw_yield: 2.0     
+  
+  material_bounds:
+    E: [1e3, 1e8]       # [RELAXED] Lower floor to allow gradients
+    nu: [0.0, 0.5]      
+    yield_stress: [1e5, 1e8] # [RELAXED] Lower floor 
+    plastic_viscosity: [0.1, 10.0] 
+    fiber_k: [1e6, 1e9] 
+  
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]     
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.1, 0.001]      
+    fiber_dir: [0.01, 0.0001]  
+    log_weights: [1e-3, 1e-5]
+  
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0         
+  
+  # Simulation Loop Control
+  max_frames: 300 
+  steps_per_frame: 666  
+  
+  # Controller Interaction Config (Wide Grip)
+  controller_stiffness: 80000.0    # [STABILITY] Lowered to prevent localized explosions
+  controller_damping: 8000.0       
+  controller_radius: 0.10         
+  controller_max_neighbors: 128   
+  controller_clamp_dv: 1.0         # [USER REQ]
+  controller_smooth_window: 2   
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.8       
+    restitution: 0.5       
+    start_time: 0.0
+    end_time: 1000.0

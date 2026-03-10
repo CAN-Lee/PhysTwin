@@ -1092,24 +1092,24 @@ class SpringMassSystemWarp:
                     outputs=[self.wp_states[i].wp_vertice_forces],
                 )
             else:
-            wp.launch(
-                kernel=eval_springs,
-                dim=self.n_springs,
-                inputs=[
-                    self.wp_states[i].wp_x,
-                    self.wp_states[i].wp_v,
-                    self.wp_states[i].wp_control_x,
-                    self.wp_states[i].wp_control_v,
-                    self.num_object_points,
-                    self.wp_springs,
-                    self.wp_rest_lengths,
-                    self.wp_spring_Y,
-                    self.dashpot_damping,
-                    self.spring_Y_min,
-                    self.spring_Y_max,
-                ],
-                outputs=[self.wp_states[i].wp_vertice_forces],
-            )
+                wp.launch(
+                    kernel=eval_springs,
+                    dim=self.n_springs,
+                    inputs=[
+                        self.wp_states[i].wp_x,
+                        self.wp_states[i].wp_v,
+                        self.wp_states[i].wp_control_x,
+                        self.wp_states[i].wp_control_v,
+                        self.num_object_points,
+                        self.wp_springs,
+                        self.wp_rest_lengths,
+                        self.wp_spring_Y,
+                        self.dashpot_damping,
+                        self.spring_Y_min,
+                        self.spring_Y_max,
+                    ],
+                    outputs=[self.wp_states[i].wp_vertice_forces],
+                )
 
             if self.object_collision_flag:
                 output_v = self.wp_states[i].wp_v_before_collision

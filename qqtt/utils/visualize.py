@@ -331,22 +331,22 @@ def visualize_pc(
                     prev_center.append(origin)
             # Adjust the viewpoint
             if window_created:
-            view_control = vis.get_view_control()
+                view_control = vis.get_view_control()
                 if view_control is None:
                     # Headless mode: skip view control setup, will use default view
                     if hasattr(logger, 'warning'):
                         logger.warning("View control is None (headless mode), using default camera view")
                 else:
                     try:
-            camera_params = o3d.camera.PinholeCameraParameters()
-            intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
-                width, height, intrinsic
-            )
-            camera_params.intrinsic = intrinsic_parameter
-            camera_params.extrinsic = w2c
-            view_control.convert_from_pinhole_camera_parameters(
-                camera_params, allow_arbitrary=True
-            )
+                        camera_params = o3d.camera.PinholeCameraParameters()
+                        intrinsic_parameter = o3d.camera.PinholeCameraIntrinsic(
+                            width, height, intrinsic
+                        )
+                        camera_params.intrinsic = intrinsic_parameter
+                        camera_params.extrinsic = w2c
+                        view_control.convert_from_pinhole_camera_parameters(
+                            camera_params, allow_arbitrary=True
+                        )
                     except Exception as e:
                         if hasattr(logger, 'warning'):
                             logger.warning(f"Could not set camera parameters: {e}. Using default view.")
@@ -361,44 +361,44 @@ def visualize_pc(
                     vis.update_geometry(controller_meshes[j])
                     prev_center[j] = origin
         if window_created:
-        vis.poll_events()
-        vis.update_renderer()
+            vis.poll_events()
+            vis.update_renderer()
 
             # Capture frame and save as image if save_video is True
         if save_video:
-                try:
-            frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-            frame = (frame * 255).astype(np.uint8)
-                except Exception as e:
-                    if hasattr(logger, 'warning'):
-                        logger.warning(f"Could not capture frame {i}: {e}. Skipping this frame.")
-                    continue
-                
-                # Apply overlay if configured
+            try:
+                frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                frame = (frame * 255).astype(np.uint8)
+            except Exception as e:
+                if hasattr(logger, 'warning'):
+                    logger.warning(f"Could not capture frame {i}: {e}. Skipping this frame.")
+                continue
+            
+            # Apply overlay if configured
             if cfg.overlay_path is not None:
                 # Get the mask where the pixel is white
                 mask = np.all(frame == [255, 255, 255], axis=-1)
                 image_path = f"{cfg.overlay_path}/{vis_cam_idx}/{i}.png"
-                    if os.path.exists(image_path):
-                overlay = cv2.imread(image_path)
-                overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-                frame[mask] = overlay[mask]
-                
-                # Convert RGB to BGR for OpenCV
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                
-                # Save frame as PNG with zero-padded frame number for ffmpeg
-                frame_filename = f"frame_{i:06d}.png"
-                frame_path = os.path.join(temp_frame_dir, frame_filename)
-                cv2.imwrite(frame_path, frame_bgr)
-                frame_paths.append(frame_path)
+                if os.path.exists(image_path):
+                    overlay = cv2.imread(image_path)
+                    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+                    frame[mask] = overlay[mask]
+            
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Save frame as PNG with zero-padded frame number for ffmpeg
+            frame_filename = f"frame_{i:06d}.png"
+            frame_path = os.path.join(temp_frame_dir, frame_filename)
+            cv2.imwrite(frame_path, frame_bgr)
+            frame_paths.append(frame_path)
 
         if visualize and window_created:
             time.sleep(1 / FPS)
 
     if window_created:
         try:
-    vis.destroy_window()
+            vis.destroy_window()
         except:
             pass  # Ignore errors when destroying window in headless mode
     

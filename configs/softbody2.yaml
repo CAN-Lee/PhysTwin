@@ -1,0 +1,100 @@
+# Output settings
+output_dir: './output_2/phys_expert_softbody2'
+tag: 'softbody_lift_moe'
+
+# [NEW] Target Scenes Filter
+# If provided, only these scenes will be trained
+target_scenes:
+  - "single_lift_sloth"
+
+# Data Config
+data:
+  root: './data/different_types' # Point to real data root
+  reverse_z: true                # Flip Z axis to match physical gravity and boundary
+  
+
+  # 2. Optimization Config
+train:
+  lr_params: 2e-4    # [STABILITY] Lowered to prevent divergence in complex cases
+  iters: 20
+  batch_size: 1
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05
+
+# 3. MPM Simulation Config
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 5e-5           # Halved for stability
+  grid_res: 64       # [CRITICAL] Increased resolution for structural rigidity
+  # Control active constitutive models: nh, co, st, fi
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  # Judged for Softbody: nh/co dominant for volume preservation and rotation.
+  init_weights: [0.4, 0.4, 0.2, 0.0]
+
+  # [NEW] SVD Clamping Upper Bound
+  svd_clamp_max: 5.0  # [DEBUG] Relaxed
+  
+  # MPM Physical Params
+  gravity: [0.0, 0.0, -9.8]
+  damping: 15.0       # [STABILITY] Increased to 15.0 to absorb gravity shocks
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial value for raw_params (log-space stiffness)
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: 0.0         # [FIRM START] Softbody needs initial volume preservation
+  init_raw_fiber_k: -2.0  # [ISOTROPIC] Lower fiber influence for volumetric objects
+  init_raw_yield: 0.0     
+  
+  # Material Parameter Optimization Bounds
+  material_bounds:
+    E: [1e4, 1e8]       # [INCREASED] Firmer material to prevent local stretching
+    nu: [0.0, 0.45]     
+    yield_stress: [1e4, 1e7] # [INCREASED] Prevent plastic yield at grip points
+    plastic_viscosity: [0.1, 10.0]
+    fiber_k: [1e3, 1e6]
+  
+  # Parameter-level Learning Rate Ranges [start, end]
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]     # [REDUCED]
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.01, 0.0001]
+    fiber_dir: [0.001, 0.00001]
+    log_weights: [1e-3, 1e-5]
+  
+  # [NEW] Staged Optimization
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0
+  
+  # Simulation Loop Control
+  max_frames: 300 
+  steps_per_frame: 666 
+  
+  # Controller Interaction Config (Target Acceleration Mode)
+  controller_stiffness: 150000.0   
+  controller_damping: 5000.0      
+  controller_radius: 0.10         
+  controller_max_neighbors: 128   
+  controller_clamp_dv: 2.0         
+  controller_smooth_window: 2
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.1       # [SLIPPERY] Reduced to 0.1 to minimize drag during lift
+    restitution: 0.5       # 碰撞恢复系数（反弹系数），0为完全非弹性，1为完全弹性碰撞
+    start_time: 0.0
+    end_time: 1000.0

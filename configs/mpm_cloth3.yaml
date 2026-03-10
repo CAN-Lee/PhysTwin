@@ -1,0 +1,99 @@
+# Output settings
+output_dir: './output_2/phys_expert_cloth3'
+tag: 'cloth_folding_stable'
+
+# [NEW] Target Scenes Filter
+# Optimized specifically for double_lift_cloth_3 (folding operation)
+target_scenes: 
+  - "double_lift_cloth_3"
+
+# Data Config
+data:
+  root: './data/different_types' # Point to real data root
+  reverse_z: true                # Flip Z axis to match physical gravity and boundary
+  
+
+  # 2. Optimization Config
+train:
+  lr_params: 1e-3    # [STABILITY] Increased for faster escape from soft/weak states
+  iters: 20
+  batch_size: 1
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05  # Slightly higher sparsity for cloth (distinct fiber/elastic regions)
+
+# 3. MPM Simulation Config
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 1e-4           # [STABILITY] Halved from 1e-4 for folding operations
+  grid_res: 16       
+  # Control active constitutive models: nh, co, st, fi
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  # Judged for Cloth Folding: nh=0.3, co=0.1, st=0.1, fi=0.5
+  init_weights: [0.3, 0.1, 0.1, 0.5]
+
+  # [NEW] SVD Clamping Upper Bound
+  svd_clamp_max: 2.5 # [STABILITY] Tightened to prevent runaway gradients in folds
+  
+  gravity: [0.0, 0.0, -9.8] 
+  damping: 5.0        # [REVISED] Reduced from 20.0 to allow natural sagging motion
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: -3.0       # [SOFT START] Lower E helps bending in heavy folds
+  init_raw_fiber_k: 1.0  # [STIFF START] Higher fiber stiffness prevents mesh expansion
+  init_raw_yield: 0.0    
+  
+    # Material Parameter Optimization Bounds
+  material_bounds:
+    E: [1e4, 1e7]       # [REVISED] Increased floor
+    nu: [0.0, 0.45]     
+    yield_stress: [1e4, 1e7] # [REVISED] Prevent plastic stretching
+    plastic_viscosity: [0.1, 10.0] 
+    fiber_k: [1e5, 1e9] # [REVISED] Prevent area expansion 
+  
+  # Parameter-level Learning Rate Ranges [start, end]
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]     
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.01, 0.0001]      
+    fiber_dir: [0.001, 0.00001]  
+    log_weights: [1e-3, 1e-5]
+  
+  # [NEW] Staged Optimization
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0         
+  
+  # Simulation Loop Control
+  # To match 30 FPS (0.0333s per frame): 5e-5 * 666 = 0.0333s
+  max_frames: 300 
+  steps_per_frame: 666 
+  
+  # Controller Interaction Config (Target Acceleration Mode)
+  controller_stiffness: 150000.0   # [REVISED] Stable high stiffness
+  controller_damping: 5000.0       
+  controller_radius: 0.10          # [PRECISION] Corner-focused grab
+  controller_max_neighbors: 128    
+  controller_clamp_dv: 2.0         
+  controller_smooth_window: 2   
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.1       # [SLIPPERY] Low friction to help cloth slide while folding
+    restitution: 0.5    # Reference from real.yaml: collide_elas
+    start_time: 0.0
+    end_time: 1000.0

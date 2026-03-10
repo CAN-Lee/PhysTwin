@@ -1,0 +1,112 @@
+# Rope Specific Config
+output_dir: './output_3/rope'
+tag: 'rope_moe'
+
+# [NEW] Target Scenes Filter
+# If provided, only these scenes will be trained
+target_scenes:
+  - "single_push_rope"
+  - "single_push_rope_1"
+  - "single_push_rope_4"
+
+data:
+  root: './data/different_types'
+  reverse_z: true
+
+
+train:
+  lr_params: 1e-3
+  iters: 50
+  batch_size: 1
+  gpus: '5,6,7'
+  num_workers: 1
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05
+  # Early Stopping Config
+  early_stop_patience: 10 # 连续多少次没有显著改进则停止
+  early_stop_min_delta: 1e-4 # 最小改进阈值
+
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 1e-4           # [STABILITY] Matched with Cloth3 for folding/complex interaction
+  grid_res: 12       
+  
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  init_weights: [0.4, 0.1, 0.1, 0.4]
+
+  svd_clamp_max: 3.0 # [STABILITY] 
+  
+  gravity: [0.0, 0.0, -9.8] 
+  damping: 30.0      # [STABILITY] Significantly increased damping for sparse rope
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: -1.0        # [FIRM START] Firmer to prevent elongation
+  init_raw_fiber_k: 4.0   # [MAX STIFFNESS] Fibers must be like steel for hemp rope
+  init_raw_yield: 2.0     # [NO STRETCH] Higher yield to avoid plastic elongation
+  
+  material_bounds:
+    E: [1e1, 1e7]       # [RELAXED] Extremely lower floor
+    nu: [0.0, 0.5]      
+    yield_stress: [1e1, 1e6] # [RELAXED] Lower floor
+    plastic_viscosity: [0.1, 10.0] 
+    fiber_k: [1e3, 1e8] # [RELAXED] Lower floor
+  
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]     
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.1, 0.001]      
+    fiber_dir: [0.01, 0.0001]  
+    log_weights: [1e-3, 1e-5]
+  
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0         
+  
+  # Simulation Loop Control
+  # To match 30 FPS (0.0333s per frame): 5e-5 * 666 = 0.0333s
+  # To match 30 FPS (0.0333s per frame): 1e-4 * 333 = 0.0333s
+  max_frames: 300 
+  steps_per_frame: 333           # [STABILITY] Doubled to match halved dt
+  
+  controller_stiffness: 150000.0   # [BOOSTED] High power within 1.0 dv limit to fight gravity
+  controller_damping: 10000.0      # Synchronized increase
+  controller_radius: 0.08         
+  controller_max_neighbors: 64    
+  controller_clamp_dv: 1.0         # [USER REQ] Reduced to prevent explosions
+  controller_smooth_window: 2   
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.7       
+    restitution: 0.5       
+    start_time: 0.0
+    end_time: 1000.0
+
+# 4. Residual PGND Config
+residual:
+  lr: 5e-4
+  feature_dim: 64
+  radius: 0.05
+  n_history: 3
+  grid_res_list: [12, 12, 12] # Matches mpm.grid_res
+  pe_num_func: 6
+  num_layers: 4
+  hidden_size: 128
+  input_scale: 1.0
+  output_scale: 0.1
+  lambda_reg: 0.005

@@ -1,0 +1,90 @@
+# Rope Specific Config (Restored Radius Search)
+output_dir: './output_2/phys_expert_rope2'
+tag: 'rope_moe_large_radius'
+
+# Target Scenes Filter
+target_scenes:
+ - "rope_double_hand"
+
+data:
+  root: './data/different_types'
+  reverse_z: true
+
+
+train:
+  lr_params: 1e-3
+  iters: 20
+  batch_size: 1
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05
+
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 2e-5           # [STABILITY] Further reduced for extreme stability
+  grid_res: 16       # [CRITICAL] Increased to 32. 12 is way too low for rope!
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  # Judged for Rope: Fiber (fi) for tensile, NH for volume/compression maintenance.
+  init_weights: [0.4, 0.1, 0.1, 0.4]
+
+  svd_clamp_max: 2.0 # [STABILITY] 
+  
+  gravity: [0.0, 0.0, -9.8] 
+  damping: 50.0      # [STABILITY] Extreme damping for sparse rope to prevent explosion
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: -1.0        # [FIRM START]
+  init_raw_nu: 1.0        # [CRITICAL] Higher nu helps maintain volume and length under compression
+  init_raw_fiber_k: 4.0   # [MAX STIFFNESS] Fibers must be like steel for hemp rope
+  init_raw_yield: 2.0     
+  
+  material_bounds:
+    E: [1e4, 1e8]       # [HARD] High elastic modulus
+    nu: [0.0, 0.5]      
+    yield_stress: [1e4, 1e8] # [HARD] High yield stress
+    plastic_viscosity: [0.1, 10.0] 
+    fiber_k: [1e6, 1e9] # [HARD] Strong fibers
+  
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]     
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.1, 0.001]      
+    fiber_dir: [0.01, 0.0001]  
+    log_weights: [1e-3, 1e-5]
+  
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0         
+  
+  # Simulation Loop Control
+  max_frames: 300 
+  steps_per_frame: 666  # [STABILITY] Doubled to match halved dt 
+  
+  # Controller Interaction Config (Restored Original Radius)
+  controller_stiffness: 80000.0    # [STABILITY] Lowered from 150k to prevent localized explosions
+  controller_damping: 8000.0       # Synchronized decrease
+  controller_radius: 0.08         
+  controller_max_neighbors: 64    
+  controller_clamp_dv: 1.0         # [USER REQ]
+  controller_smooth_window: 2   
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.3       
+    restitution: 0.5       
+    start_time: 0.0
+    end_time: 1000.0

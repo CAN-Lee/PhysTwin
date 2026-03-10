@@ -1,0 +1,120 @@
+# Output settings
+output_dir: './output_3/softbody'
+tag: 'softbody'
+
+# [NEW] Target Scenes Filter
+target_scenes:
+  - "double_lift_zebra"
+  - "double_lift_sloth"
+  - "double_stretch_zebra"
+  - "double_stretch_sloth"
+  - "single_lift_dinosor"
+  - "single_push_sloth"
+  - "single_lift_zebra"
+
+
+# Data Config
+data:
+  root: './data/different_types' # Point to real data root
+  reverse_z: true                # Flip Z axis to match physical gravity and boundary
+
+
+# 2. Optimization Config
+train:
+  lr_params: 1e-3
+  iters: 50
+  batch_size: 1
+  gpus: '4,5,6,7'
+  num_workers: 2
+  lambda_track: 1.0
+  lambda_chamfer: 1.0
+  lambda_vel: 0.1
+  lambda_smooth: 0.1
+  lambda_sparse: 0.05
+  # Early Stopping Config
+  early_stop_patience: 10 # 连续多少次没有显著改进则停止
+  early_stop_min_delta: 1e-4 # 最小改进阈值
+
+# 3. MPM Simulation Config
+mpm:
+  device: 'cuda'
+  n_particles: 5000 
+  dt: 1e-4           # Halved for stability
+  grid_res: 32       # [CRITICAL] Reduced from 64 to avoid CFL violation at dt=1e-4
+
+  # Control active constitutive models: nh, co, st, fi
+  active_experts: ['nh', 'co', 'st', 'fi'] 
+  
+  # [NEW] Initial Expert Weights (Softmax-ready probabilities)
+  # Judged for Softbody: nh/co dominant for volume preservation and rotation.
+  init_weights: [0.4, 0.4, 0.2, 0.0]
+
+  svd_clamp_max: 2.0 # [STABILITY] Tightened to prevent stress explosion
+  
+  gravity: [0.0, 0.0, -9.8]
+  damping: 30.0       # [STABILITY] Increased to absorb high-frequency energy
+  grid_v_damping_scale: 0.999 
+  clip_bound: 0.5
+  
+  # Initial values for raw_params (log-space mapping)
+  init_raw_params: -1.0 
+  init_raw_E: -1.0         # [SOFT START] Prevents massive initial forces
+  init_raw_fiber_k: -2.0  # [ISOTROPIC] Lower fiber influence for volumetric objects
+  init_raw_yield: 0.0     
+  
+  material_bounds:
+    E: [1e4, 1e8]       # Firmer material
+    nu: [0.0, 0.45]     
+    yield_stress: [1e4, 1e7] # Prevent plastic yield
+    plastic_viscosity: [0.1, 10.0]
+    fiber_k: [1e3, 1e6]
+  
+  lr_ranges:
+    E: [0.1, 0.001]
+    nu: [0.1, 0.001]
+    yield_stress: [0.01, 0.0001]
+    plastic_viscosity: [0.01, 0.0001] 
+    fiber_k: [0.01, 0.0001]
+    fiber_dir: [0.001, 0.00001]
+    log_weights: [1e-3, 1e-5]
+  
+  weight_warmup_iters: 10
+  fiber_warmup_iters: 0
+  
+  # Simulation Loop Control
+  max_frames: 300 
+  steps_per_frame: 333 
+  
+  # Controller Interaction Config (Target Acceleration Mode)
+  controller_stiffness: 150000.0   
+  controller_damping: 5000.0      
+  controller_radius: 0.10         
+  controller_max_neighbors: 128   
+  controller_clamp_dv: 2.0         # [USER REQ] Reduced to prevent explosions
+  controller_smooth_window: 2
+  controller_warmup_frames: 3
+  
+  # Default Boundary (Slip with Friction)
+  boundary:
+    type: 'surface_collider'
+    point: [0.0, 0.0, 0.0]
+    normal: [0.0, 0.0, 1.0]
+    surface: 'slip'
+    friction: 0.1
+    restitution: 0.5
+    start_time: 0.0
+    end_time: 1000.0
+
+# 4. Residual PGND Config
+residual:
+  lr: 5e-4
+  feature_dim: 64
+  radius: 0.05
+  n_history: 3
+  grid_res_list: [32, 32, 32] # Matches mpm.grid_res
+  pe_num_func: 6
+  num_layers: 4
+  hidden_size: 128
+  input_scale: 1.0
+  output_scale: 0.8
+  lambda_reg: 0.005

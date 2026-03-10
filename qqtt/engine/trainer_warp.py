@@ -524,7 +524,7 @@ class InvPhyTrainerWarp:
                     if cfg.use_graph:
                         # Suppress Warp warnings during graph launch
                         with WarpStderrFilter(sys.stderr):
-                        wp.capture_launch(self.simulator.graph)
+                            wp.capture_launch(self.simulator.graph)
                         # [Gradient Bridge] For graph mode, gradients are computed in the graph
                         # We still need to manually propagate from Warp to PyTorch
                         if self.simulator.wp_model_weights is not None:
@@ -548,7 +548,7 @@ class InvPhyTrainerWarp:
                                 self.simulator.calculate_loss()
                             # Suppress Warp warnings during backward (using custom filter)
                             with WarpStderrFilter(sys.stderr):
-                            self.simulator.tape.backward(self.simulator.loss)
+                                self.simulator.tape.backward(self.simulator.loss)
                             
                             # [Gradient Bridge] Manually propagate gradients from Warp to PyTorch
                             # Key insight: Warp's tape.backward() computes gradients but may not automatically
@@ -600,7 +600,7 @@ class InvPhyTrainerWarp:
                                 self.simulator.calculate_simple_loss()
                             # Suppress Warp warnings during backward (using custom filter)
                             with WarpStderrFilter(sys.stderr):
-                            self.simulator.tape.backward(self.simulator.loss)
+                                self.simulator.tape.backward(self.simulator.loss)
                             
                             # [Gradient Bridge] Manually propagate gradients from Warp to PyTorch
                             if self.simulator.wp_model_weights is not None:
@@ -707,7 +707,7 @@ class InvPhyTrainerWarp:
                 
                 # Only log video to wandb if file was actually created (not skipped in headless mode)
                 if os.path.exists(video_path):
-                wandb.log(
+                    wandb.log(
                     {
                         "video": wandb.Video(
                             video_path,

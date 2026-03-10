@@ -32,6 +32,12 @@ quick*
 visualization
 experiments_transfer/
 results/
+output/
+output_2/
+output_3/
+DINO_IDM/
+latent_IDM/
+third_module/
 experiments*/
 gnn_test/
 exp_results/

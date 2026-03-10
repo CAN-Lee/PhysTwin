@@ -1,0 +1,9 @@
+\subsubsection{\textbf{4D Appearance Reconstruction via Deforming Gaussians}}
+3D Gaussian Splatting offers real-time rendering of appearance but assumes static scenes. To reconstruct dynamic photorealistic appearance of deformable objects, we extend it to dynamic deformations, where Gaussians are anchored to the physics-driven material points. Specifically, we deform canonical-frame Gaussians $\mathcal{G}_0 = \{\bm{\mu}_g^0, \bm{R}_g^0, \bm{s}^0, \mathbf{c}_g, \alpha_g\}_{g=1}^N$ to other target frames using Linear Blend Skinning (LBS). At any time step $t$, the deformed position $\bm{\mu}_g^t$ and orientation $\mathbf{q}_g^t$ (represented as quaternions) of Gaussian $g$ are computed by:
+\begin{align}
+\bm{\mu}_g^t &= \sum_{i \in \mathcal{N}(g)} w_{g,i} \left[ \mathbf{R}_i^t (\bm{\mu}_g^0 - \mathbf{b}_i^0) + (\mathbf{b}_i^0 + \mathbf{m}_i^t) \right] \\
+\mathbf{q}_g^t &= \text{Normalize} \left( \sum_{i \in \mathcal{N}(g)} w_{g,i} \mathbf{q}_i^t \right) \otimes \mathbf{q}_g^0
+\end{align}
+where $\mathbf{b}_i^0$ and $\mathbf{m}_i^t$ are the rest position and displacement of the $i$-th physics-driven control point, $\mathbf{R}_i^t$ and $\mathbf{q}_i^t$ are the estimated local rotation matrix and its quaternion form, and $w_{g,i}$ are the skinning weights determined by the initial proximity between Gaussians and control points. Notably, the scale $\bm{\R}_s^0$, color $\mathbf{c}_g$, and opacity $\alpha_g$ remain constant during deformation to ensure rendering stability.
+
+This strategy provides two critical advantages: (1) \textbf{temporal coherence}—Gaussian motion is slaved to smooth physics trajectories, eliminating flicker; (2) \textbf{geometry-appearance consistency}—surface details (encoded in Gaussian appearance) evolve with true strain, preserving material texture under deformation. Coupling 4D appearance with underlying physical dynamics, closing the loop between vision and mechanics.
