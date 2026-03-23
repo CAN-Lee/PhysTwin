@@ -1,7 +1,6 @@
 import torch
 import pickle
 import os
-import glob
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
@@ -11,106 +10,47 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def get_config_for_case(case_name, config_map, default_configs):
-    # 1. Check explicit mapping first
-    if case_name in config_map:
-        return config_map[case_name]
-    
-    # 2. Check heuristics
-    if 'rope' in case_name.lower():
-        # Heuristic for rope:
-        # rope3.yaml -> single_lift_rope (Wide Grip for lifting)
-        # rope2.yaml -> rope_double_hand (Balanced/Anti-Explosion)
-        # rope.yaml  -> single_push_rope* (Soft, Gradient recovery)
-        
-        if 'single_lift_rope' in case_name:
-             return default_configs['rope3']
-        elif 'rope_double_hand' in case_name:
-             return default_configs['rope2']
-        return default_configs['rope']
-    elif any(kw in case_name.lower() for kw in ['zebra', 'sloth', 'dinosor']):
-        # Heuristic for softbody:
-        # softbody2.yaml  -> single_lift_sloth (Aggressive, Small Radius)
-        # softbody.yaml -> All others (Balanced, Large Radius)
-        if 'single_lift_sloth' in case_name:
-            return default_configs['softbody2']
-        return default_configs['softbody']
-    elif 'cloth' in case_name.lower():
-        # Heuristic for cloth:
-        # mpm_cloth3.yaml -> double_lift_cloth_3 (folding)
-        # mpm_cloth2.yaml -> single_lift_cloth* (heavy lift)
-        # mpm_cloth.yaml  -> double_lift_cloth_1, single_clift_cloth* (general)
-        
-        if 'double_lift_cloth_3' in case_name:
-             return default_configs['cloth3']
-        elif 'single_lift_cloth' in case_name:
-             return default_configs['cloth2']
-        else:
-             return default_configs['cloth']
-    
-    return default_configs['default']
-
-def check_all_connections(base_path, output_dir, configs_dir):
+def check_all_connections(base_path, output_dir, config_paths):
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Build Config Map from target_scenes
-    config_map = {}
-    default_configs = {}
-    
-    # Load specific configs to build map
-    config_files = {
-        'rope': 'rope.yaml',
-        'rope2': 'rope2.yaml',
-        'rope3': 'rope3.yaml',
-        'softbody': 'softbody.yaml',
-        'softbody2': 'softbody2.yaml',
-        'cloth': 'mpm_cloth.yaml',
-        'cloth2': 'mpm_cloth2.yaml',
-        'cloth3': 'mpm_cloth3.yaml',
-    }
-    
-    loaded_configs = {}
+    # Build scene -> config mapping from target_scenes in each YAML
+    scene_config_map = {}  # scene_name -> (cfg, config_filename)
     
     print("Loading configurations...")
-    for key, filename in config_files.items():
-        path = os.path.join(configs_dir, filename)
-        if os.path.exists(path):
-            cfg = load_config(path)
-            loaded_configs[key] = cfg
-            default_configs[key] = cfg # Store as default for heuristic fallback
-            
-            # Map target scenes
-            if 'target_scenes' in cfg and cfg['target_scenes']:
-                for scene in cfg['target_scenes']:
-                    config_map[scene] = cfg
-            print(f"  Loaded {filename}")
-        else:
-            print(f"  [WARNING] Config {filename} not found.")
-
-    default_configs['default'] = loaded_configs.get('cloth') # Fallback
-
-    # 2. Find all cases
-    cases_paths = sorted(glob.glob(os.path.join(base_path, "*")))
-    valid_cases = [p for p in cases_paths if os.path.isdir(p) and os.path.exists(os.path.join(p, "final_data.pkl"))]
+    for config_path in config_paths:
+        if not os.path.exists(config_path):
+            print(f"  [WARNING] {config_path} not found, skipping.")
+            continue
+        cfg = load_config(config_path)
+        filename = os.path.basename(config_path)
+        scenes = cfg.get('target_scenes', [])
+        if not scenes:
+            print(f"  [WARNING] {filename} has no target_scenes, skipping.")
+            continue
+        tag = cfg.get('tag', os.path.splitext(filename)[0])
+        for scene in scenes:
+            scene_config_map[scene] = (cfg, filename, tag)
+        print(f"  Loaded {filename} [tag={tag}]: {len(scenes)} scenes")
     
-    print(f"\nFound {len(valid_cases)} cases to process.")
+    print(f"\nTotal target scenes: {len(scene_config_map)}")
 
-    for case_path in valid_cases:
-        case_name = os.path.basename(case_path)
+    processed = 0
+    for case_name in sorted(scene_config_map.keys()):
+        case_path = os.path.join(base_path, case_name)
         pkl_path = os.path.join(case_path, "final_data.pkl")
         
-        # 3. Determine Parameters from Config
-        cfg = get_config_for_case(case_name, config_map, default_configs)
-        
-        if cfg is None:
-            print(f"Skipping {case_name}: No matching config found.")
+        if not os.path.exists(pkl_path):
+            print(f"Skipping {case_name}: final_data.pkl not found.")
             continue
+        
+        cfg, cfg_file, tag = scene_config_map[case_name]
 
         radius = cfg['mpm'].get('controller_radius', 0.2)
         max_neighbors = cfg['mpm'].get('controller_max_neighbors', 16)
         stiffness = cfg['mpm'].get('controller_stiffness', 'N/A')
         
-        print(f"Processing {case_name} using config (Radius: {radius}, K: {max_neighbors})...")
+        print(f"Processing {case_name} [{cfg_file}] (Radius: {radius}, K: {max_neighbors})...")
+        processed += 1
 
         # 4. Load Data
         with open(pkl_path, 'rb') as f:
@@ -155,16 +95,25 @@ def check_all_connections(base_path, output_dir, configs_dir):
                     ax.plot([c_pos[0], p[0]], [c_pos[1], p[1]], color='red', alpha=0.15, linewidth=1.0)
                     line_count += 1
         
-        ax.set_title(f"Case: {case_name}\nRadius: {radius}, K: {max_neighbors}, Stiffness: {stiffness}\nConnections: {line_count}")
+        ax.set_title(f"Case: {case_name} [{cfg_file}]\nRadius: {radius}, K: {max_neighbors}, Stiffness: {stiffness}\nConnections: {line_count}")
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_aspect('equal', adjustable='box')
         ax.grid(True, linestyle='--', alpha=0.5)
         
-        output_path = os.path.join(output_dir, f"{case_name}_connection.png")
+        sub_dir = os.path.join(output_dir, tag)
+        os.makedirs(sub_dir, exist_ok=True)
+        output_path = os.path.join(sub_dir, f"{case_name}_connection.png")
         plt.savefig(output_path)
         plt.close()
         print(f"  -> Saved to {output_path}")
+    
+    print(f"\nDone. Processed {processed}/{len(scene_config_map)} target scenes.")
 
 if __name__ == "__main__":
-    check_all_connections("data/different_types", "all_connection_checks", "configs")
+    config_paths = [
+        "configs/mpm_cloth.yaml",
+        "configs/rope.yaml",
+        "configs/softbody.yaml",
+    ]
+    check_all_connections("data/different_types", "all_connection_checks", config_paths)

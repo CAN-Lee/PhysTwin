@@ -1,0 +1,20 @@
+---
+description: Use conda environment phystwin when running or testing Python scripts
+alwaysApply: true
+---
+
+# Python 测试环境
+
+运行或测试本项目的 Python 脚本时，**必须先激活 conda 环境 `phystwin`**。
+
+在终端中执行：
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate phystwin
+```
+然后再运行 `python` / `pytest` 等命令。
+
+或在一条命令中：
+```bash
+conda run -n phystwin python your_script.py
+```

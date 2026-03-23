@@ -6,6 +6,8 @@ import subprocess
 from queue import Empty
 import time
 
+import sys
+
 def worker(gpu_id, task_queue, config_path, iters):
     gpu_id = str(gpu_id).strip()
     while True:
@@ -17,7 +19,8 @@ def worker(gpu_id, task_queue, config_path, iters):
         selected_config = config_path if config_path else "configs/softbody.yaml"
         print(f"\n[GPU {gpu_id}] >>> [SOFTBODY MODE] Training Scene: {scene_id} using {selected_config}", flush=True)
         
-        cmd = ["python", "train_mpm.py", "--case_name", scene_id, "--iters", str(iters), "--config", selected_config]
+        # [FIX] Use sys.executable to ensure same python environment is used in subprocess
+        cmd = [sys.executable, "train_mpm.py", "--case_name", scene_id, "--iters", str(iters), "--config", selected_config]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu_id
         

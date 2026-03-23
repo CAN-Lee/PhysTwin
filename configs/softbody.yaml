@@ -1,5 +1,5 @@
 # Output settings
-output_dir: './output_3/softbody'
+output_dir: './output_3/softbody_warp'
 tag: 'softbody'
 
 # [NEW] Target Scenes Filter
@@ -11,35 +11,43 @@ target_scenes:
   - "single_lift_dinosor"
   - "single_push_sloth"
   - "single_lift_zebra"
+  - "single_lift_sloth"
 
 
 # Data Config
 data:
   root: './data/different_types' # Point to real data root
   reverse_z: true                # Flip Z axis to match physical gravity and boundary
+  # Gaussian filling: add new_internal (and optionally dense) to MPM init_pos when PLY exists
+  gaussian_output_dir: './gaussian_output'
+  gaussian_grid_n: 96            # [STABILITY] Reduced from 96 to limit total particles
+  gaussian_density_thres: 0.8    
+  gaussian_search_thres: 0.3     # [STABILITY] Increased to reduce internal filling noise
+  gaussian_max_particles_per_cell: 3  # [STABILITY] Reduced from 3 to prevent OOM with large N
 
 
 # 2. Optimization Config
 train:
   lr_params: 1e-3
-  iters: 50
+  iters: 200
   batch_size: 1
-  gpus: '4,5,6,7'
-  num_workers: 2
+  gpus: '4,6,7'
+  num_workers: 3
   lambda_track: 1.0
   lambda_chamfer: 1.0
   lambda_vel: 0.1
   lambda_smooth: 0.1
   lambda_sparse: 0.05
   # Early Stopping Config
-  early_stop_patience: 10 # 连续多少次没有显著改进则停止
-  early_stop_min_delta: 1e-4 # 最小改进阈值
+  early_stop_patience: 20 # 连续多少次没有显著改进则停止
+  early_stop_min_delta: 1e-5 # 最小改进阈值
 
 # 3. MPM Simulation Config
 mpm:
+  use_warp: true
   device: 'cuda'
-  n_particles: 5000 
-  dt: 1e-4           # Halved for stability
+  n_particles: 100000 
+  dt: 1e-4           # Restored to 1e-4
   grid_res: 32       # [CRITICAL] Reduced from 64 to avoid CFL violation at dt=1e-4
 
   # Control active constitutive models: nh, co, st, fi
@@ -47,35 +55,38 @@ mpm:
   
   # [NEW] Initial Expert Weights (Softmax-ready probabilities)
   # Judged for Softbody: nh/co dominant for volume preservation and rotation.
-  init_weights: [0.4, 0.4, 0.2, 0.0]
+  init_weights: [0.4, 0.4, 0.1, 0.1]
 
-  svd_clamp_max: 2.0 # [STABILITY] Tightened to prevent stress explosion
+  floor_margin: 0.0       # 物体放在桌面上，地面紧贴底部，避免初始自由落体
+  tape_window: 5          # Warp tape 只记录每帧最后 N 个子步骤，防止长链梯度爆炸
+  grad_clip_norm: 0.1     # 物理参数(E/nu/weights等)的梯度裁剪阈值，独立于神经网络
+  svd_clamp_max: 2.0
   
   gravity: [0.0, 0.0, -9.8]
   damping: 30.0       # [STABILITY] Increased to absorb high-frequency energy
-  grid_v_damping_scale: 0.999 
+  grid_v_damping_scale: 0.995 
   clip_bound: 0.5
   
   # Initial values for raw_params (log-space mapping)
   init_raw_params: -1.0 
-  init_raw_E: -1.0         # [SOFT START] Prevents massive initial forces
-  init_raw_fiber_k: -2.0  # [ISOTROPIC] Lower fiber influence for volumetric objects
+  init_raw_E: 0.0         # sigmoid(0)=0.5 → E≈3.16e5 Pa (bounds [1e4,1e7] 的几何中心)
+  init_raw_fiber_k: -1.0  # [STABILITY] Small fiber influence for structural integrity
   init_raw_yield: 0.0     
   
   material_bounds:
-    E: [1e4, 1e8]       # Firmer material
+    E: [1e4, 1e7]       # 毛绒玩具范围：1e4(极软)~1e7(较硬橡胶)
     nu: [0.0, 0.45]     
     yield_stress: [1e4, 1e7] # Prevent plastic yield
     plastic_viscosity: [0.1, 10.0]
     fiber_k: [1e3, 1e6]
   
   lr_ranges:
-    E: [0.1, 0.001]
-    nu: [0.1, 0.001]
-    yield_stress: [0.01, 0.0001]
-    plastic_viscosity: [0.01, 0.0001] 
-    fiber_k: [0.01, 0.0001]
-    fiber_dir: [0.001, 0.00001]
+    E: [1e-3, 1e-5]
+    nu: [1e-3, 1e-5]
+    yield_stress: [1e-3, 1e-5]
+    plastic_viscosity: [1e-3, 1e-5]
+    fiber_k: [1e-3, 1e-5]
+    fiber_dir: [1e-4, 1e-6]
     log_weights: [1e-3, 1e-5]
   
   weight_warmup_iters: 10
@@ -83,14 +94,14 @@ mpm:
   
   # Simulation Loop Control
   max_frames: 300 
-  steps_per_frame: 333 
+  steps_per_frame: 333 # Restored to match dt=1e-4
   
   # Controller Interaction Config (Target Acceleration Mode)
-  controller_stiffness: 150000.0   
+  controller_stiffness: 1000000.0   
   controller_damping: 5000.0      
-  controller_radius: 0.10         
+  controller_radius: 0.11         # [NATURAL] Increased radius to catch particles without forced connection
   controller_max_neighbors: 128   
-  controller_clamp_dv: 2.0         # [USER REQ] Reduced to prevent explosions
+  controller_clamp_dv: 10.0        # [ROBUSTNESS] Increased to allow faster movement to target
   controller_smooth_window: 2
   controller_warmup_frames: 3
   
@@ -100,14 +111,18 @@ mpm:
     point: [0.0, 0.0, 0.0]
     normal: [0.0, 0.0, 1.0]
     surface: 'slip'
-    friction: 0.1
+    friction: 0.8
     restitution: 0.5
     start_time: 0.0
     end_time: 1000.0
 
 # 4. Residual PGND Config
 residual:
-  lr: 5e-4
+  mode: 'residual' # "residual", "damping", "both"
+  warmup_iters: 10  # [STABILITY] Let physics parameters (E, weights) stabilize first
+  # damping_interval: 333 # [STABILITY] Sync with steps_per_frame to update once per frame
+  lr: 1e-2
+  grad_clip_norm: 1.0     # ResidualPGND 的梯度裁剪阈值，独立于物理参数（避免被 tape 梯度淹没）
   feature_dim: 64
   radius: 0.05
   n_history: 3
@@ -118,3 +133,43 @@ residual:
   input_scale: 1.0
   output_scale: 0.8
   lambda_reg: 0.005
+
+bridge:
+  enabled: true
+  gaussian_root: './gaussian_output'
+  gaussian_exp_name: 'auto_latest'
+  inference_dir: './output_3/mpm_inference'
+  num_render_anchors: 4096
+  anchor_particle_k: 16
+  anchor_graph_k: 8
+  gaussian_anchor_k: 8
+  anchor_particle_temp: 0.01
+  max_pos_residual: 0.002
+  max_opacity_delta: 0.2
+  residual_hidden_size: 128
+  residual_layers: 3
+  stage1_global_optimization: true
+  stage1_shuffle_train_samples: true
+  stage1_val_max_samples: 0
+  stage1_train_static_binding: false
+  stage1_train_residual: true
+  stage1_iters: 50
+  stage2_iters: 50
+  stage1_lr_static: 1e-3
+  stage1_lr_residual: 3e-4
+  stage2_lr: 5e-5
+  stage1_grad_clip_norm: 1.0
+  joint_warmup_iters: 20
+  render_frame_stride: 10
+  lambda_dssim: 0.2
+  lambda_rgb: 1.0
+  lambda_mask: 0.5
+  lambda_bind: 1e-4
+  lambda_weight_sparse: 1e-4
+  lambda_res_pos: 1e-4
+  lambda_res_opacity: 1e-4
+  lambda_res_temporal: 1e-4
+  lambda_canonical_xyz: 10.0
+  lambda_canonical_opacity: 0.1
+  lambda_render_joint: 0.005
+  eval_every: 5

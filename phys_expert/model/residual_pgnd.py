@@ -40,16 +40,17 @@ class ResidualPGND(nn.Module):
         )
         
         # 2. Neural Field Decoder (Eulerian)
+        # Output channel: 4 (3 for delta_v, 1 for damping gamma)
         self.decoder = CondNeRFModel(
             xyz_dim=self.pe_dim,
             condition_dim=self.feature_dim,
-            out_channel=3,
+            out_channel=4,
             num_layers=getattr(cfg, 'num_layers', 4),
             hidden_size=getattr(cfg, 'hidden_size', 128),
             skip_connect_every=4
         )
 
-    def forward(self, x_mpm: Tensor, v_mpm: Tensor, x_start: Tensor, x_his: Tensor, v_his: Tensor) -> Tensor:
+    def forward(self, x_mpm: Tensor, v_mpm: Tensor, x_start: Tensor, x_his: Tensor, v_his: Tensor, mode: str = "residual") -> Tensor:
         """
         Predict correction based on MPM solver results.
         Args:
@@ -58,6 +59,7 @@ class ResidualPGND(nn.Module):
             x_start: positions at the start of this frame [B, N, 3]
             x_his: history positions [B, N, H, 3]
             v_his: history velocities [B, N, H, 3]
+            mode: "residual" (returns delta_v) or "damping" (returns gamma) or "both"
         """
         bsz, num_particles, _ = x_mpm.shape
         device = x_mpm.device
@@ -102,12 +104,24 @@ class ResidualPGND(nn.Module):
         
         node_pe_flat = positional_encoding(node_pos_flat, self.pe_num_func)
         
-        delta_v_node_flat = self.decoder(node_pe_flat, node_feat_flat)
-        delta_v_node_flat = torch.tanh(delta_v_node_flat) # Stability clamp
+        raw_output = self.decoder(node_pe_flat, node_feat_flat)
         
+        # Branch 1: delta_v [B, N_pts * 27, 3]
+        delta_v_node_flat = torch.tanh(raw_output[..., :3])
         delta_v_node = delta_v_node_flat.reshape(bsz, num_particles, 27, 3)
+        delta_v_p = torch.sum(weights.unsqueeze(-1) * delta_v_node, dim=2) * self.output_scale
         
-        # 6. G2P: Interpolate node corrections back to particles
-        delta_v_p = torch.sum(weights.unsqueeze(-1) * delta_v_node, dim=2) 
+        # Branch 2: damping gamma [B, N_pts * 27, 1]
+        # Map to [0, 0.1] for safety
+        gamma_node_flat = torch.sigmoid(raw_output[..., 3:]) * 0.1
+        gamma_node = gamma_node_flat.reshape(bsz, num_particles, 27, 1)
+        gamma_p = torch.sum(weights.unsqueeze(-1) * gamma_node, dim=2)
         
-        return delta_v_p * self.output_scale
+        if mode == "residual":
+            return delta_v_p
+        elif mode == "damping":
+            return gamma_p
+        elif mode == "both":
+            return delta_v_p, gamma_p
+        else:
+            raise ValueError(f"Unknown mode: {mode}")

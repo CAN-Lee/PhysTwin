@@ -1,11 +1,18 @@
+import warnings
+# [FIX] Suppress Warp's UserWarning about non-leaf tensors early
+warnings.filterwarnings("ignore", message="The .grad attribute of a Tensor that is not a leaf Tensor is being accessed", module="warp")
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import os
+import taichi as ti # [FIX] Add taichi to set logging level
+ti.init(arch=ti.cpu, log_level=ti.WARN) # [FIX] Suppress Taichi startup messages
 import pickle
 import shutil
 import subprocess
+import tempfile
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,10 +25,12 @@ from pytorch3d.loss import chamfer_distance
 import matplotlib
 matplotlib.use('Agg')
 
-from ..engine.simulator_mpm import MPMSimulator
+from ..model.diff_simulator.warp_solver.simulator_warp import WarpMPMSimulator
 from ..data.dataset_mpm import PhysTwinDataset
 from ..utils.mpm_utils import youngs_poisson_to_lame
 from ..model.residual_pgnd import ResidualPGND
+import warp as wp
+from ..model.diff_simulator.warp_solver.warp_utils import torch2warp_vec3, torch2warp_float
 
 class PhysExpertMPMTrainer:
     """
@@ -169,7 +178,16 @@ class PhysExpertMPMTrainer:
         os.makedirs(self.log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=self.log_dir)
 
-        self.simulator = MPMSimulator(cfg.mpm).to(self.device)
+        # [NEW] Choose Simulator Backend
+        self.use_warp = getattr(cfg.mpm, 'use_warp', False)
+        if self.use_warp:
+            print("[INFO] Using NVIDIA Warp backend for MPM simulation.")
+            self.simulator = WarpMPMSimulator(cfg.mpm).to(self.device)
+        else:
+            from ..engine.simulator_mpm import MPMSimulator
+            print("[INFO] Using PyTorch backend for MPM simulation.")
+            self.simulator = MPMSimulator(cfg.mpm).to(self.device)
+        
         self.simulator.debug_mode = True # [DEBUG] Enable velocity clamping inspection
         
         # 4. [NEW] Initialize Residual PGND
@@ -206,15 +224,17 @@ class PhysExpertMPMTrainer:
         p_min = all_pts.min(dim=0)[0]
         p_max = all_pts.max(dim=0)[0]
         
-        # [REVISED] Improved Auto-centering Strategy
+        # [REVISED] Auto-centering Strategy
         # X and Y: Center the entire sequence to avoid side-wall collisions
-        # Z: Set offset so the global minimum Z is at a safe height (0.15) in simulation space
+        # Z: Place object just above the ground plane.
+        #    Ground is at boundary point [0,0,0] + shift 0.5 = z_grid=0.5.
+        #    We want min_z_grid = 0.5 + margin.  Since z_grid = z_orig + offset + 0.5:
+        #    offset_z = margin - p_min[2]
+        floor_margin = getattr(self.cfg.mpm, 'floor_margin', 0.05)
         self.auto_offset = torch.zeros(3, device=self.device)
         self.auto_offset[0] = -(p_min[0] + p_max[0]) / 2.0
         self.auto_offset[1] = -(p_min[1] + p_max[1]) / 2.0
-        # Target Z_sim = 0.15. Since Simulator adds 0.5 internally: 
-        # Z_orig + auto_offset.z + 0.5 = 0.15 => auto_offset.z = 0.15 - 0.5 - p_min[2]
-        self.auto_offset[2] = 0.15 - 0.5 - p_min[2]
+        self.auto_offset[2] = floor_margin - p_min[2]
         
         # Sync offset to simulator and refresh ground boundary
         self.simulator.base_offset = self.auto_offset
@@ -349,6 +369,12 @@ class PhysExpertMPMTrainer:
         
         return weights, p_mu.squeeze(), p_lam.squeeze(), p_fiber_k.squeeze(), p_fiber_dir, friction, p_yield.squeeze(), p_E.squeeze(), p_nu.squeeze(), p_visc.squeeze()
 
+    def on_train_iteration_start(self, iter_idx: int, total_frames: int):
+        return None
+
+    def compute_optional_render_loss(self, iter_idx: int, frame_idx: int, x_curr: torch.Tensor):
+        return torch.tensor(0.0, device=self.device)
+
     def train(self, num_iters=50):
         print(f"\nStarting MPM Training (System ID) for scene: {self.scene_id}")
         
@@ -380,6 +406,17 @@ class PhysExpertMPMTrainer:
         gt_tracks = (self.data['gt_surface_tracks'].to(self.device) + offset)
         num_supervised = self.data['num_supervised']
         
+        pc = self.data.get('particle_counts', {})
+        if pc:
+            self.writer.add_text('ParticleCounts', 
+                f"surface={pc['surface']}, other_surface={pc['other_surface']}, "
+                f"interior={pc['interior']}, gaussian={pc['gaussian_filled']}, "
+                f"**total={pc['total']}**", 0)
+            for k, v in pc.items():
+                self.writer.add_scalar(f'Particles/{k}', v, 0)
+            tqdm.write(f"[INFO] Particles: surface={pc['surface']}, other_surface={pc['other_surface']}, "
+                       f"interior={pc['interior']}, gaussian={pc['gaussian_filled']}, total={pc['total']}")
+        
         # [NEW] Initialize History Buffers for ResidualPGND
         H = getattr(self.cfg.residual if hasattr(self.cfg, 'residual') else None, 'n_history', 2)
         x_history = [] 
@@ -393,6 +430,7 @@ class PhysExpertMPMTrainer:
         # 增加外部进度条
         # [RESUME] Start from correct iter
         last_iter = start_iter
+        print("") # [FIX] Ensure first iteration output is clean
         main_pbar = tqdm(range(start_iter, num_iters), desc=f"[{self.scene_id}] Optimization Progress")
 
         for i in main_pbar:
@@ -400,6 +438,10 @@ class PhysExpertMPMTrainer:
             self.optimizer.zero_grad()
             self.simulator.reset(init_pos, controller_pos=self.controller_points[0])
             
+            # [NEW] Setup Warp Tape if enabled
+            if self.use_warp:
+                self.simulator.tape = None # Will be created per-frame in the loop to avoid graph accumulation
+
             # [NEW] Reset history with current initial state
             x_history = [init_pos.clone() for _ in range(H)]
             v_history = [torch.zeros_like(init_pos) for _ in range(H)]
@@ -439,18 +481,31 @@ class PhysExpertMPMTrainer:
             self.raw_viscosity.requires_grad = is_plastic_phase
             
             # 5. [REVISED] Residual PGND is ALWAYS active for joint training
+            # [STABILITY] Added warmup for ResidualPGND to let physics stabilize first
+            res_warmup = getattr(self.cfg.residual, 'warmup_iters', 5)
             if self.residual_net is not None:
-                self.residual_net.requires_grad = True
+                self.residual_net.requires_grad = (i >= res_warmup)
                 self.residual_net.train()
+                # If in warmup, just skip it or force output to zero
+                res_mode = getattr(self.cfg.residual, 'mode', 'both')
+                if i < res_warmup:
+                    res_mode = 'none' 
 
             # [NEW] Indicators for monitoring Residual contribution
             res_stats = {
-                'mean_mag': [], 'max_mag': [], 'ratio_to_phys': [], 'cos_sim': []
+                'mean_mag': [], 'max_mag': [], 'ratio_to_phys': [], 'cos_sim': [],
+                'mean_damping': [] # [NEW] Track damping
             }
 
             total_loss = 0.0
+            total_damping_loss = 0.0 # [NEW] Track damping penalty
+            self.on_train_iteration_start(i, T)
             
-            frame_pbar = tqdm(range(T), desc=f"  [{self.scene_id}] Iter {i+1}", leave=False)
+            # [FIX] Better progress bar formatting to avoid clashing with Warp/Taichi output
+            frame_pbar = tqdm(range(T), 
+                              desc=f"  [{self.scene_id}] Iter {i+1}", 
+                              leave=False, 
+                              bar_format='{l_bar}{bar:20}{r_bar}')
             
             def gather_and_interp(patch_data):
                 flat_idx = self.patch_idx.squeeze(0).view(-1)
@@ -458,6 +513,13 @@ class PhysExpertMPMTrainer:
                 return torch.sum(self.interp_weights * gathered, dim=2).squeeze(0)
 
             for t in frame_pbar:
+                # [FIX] Move Warp Tape creation inside the frame loop to avoid graph accumulation slowdown.
+                # Since we detach simulator state every frame, we only need the tape to record ops for the current frame.
+                tape = None
+                if self.use_warp:
+                    tape = wp.Tape()
+                    self.simulator.tape = tape
+
                 # [MEMORY SAFE] Re-calculate params inside the loop to avoid retain_graph=True.
                 w_patch, mu_patch, lam_patch, fk_patch, fdir_patch, friction, yield_patch, E_patch, nu_patch, visc_patch = self.get_current_phys_props()
                 
@@ -470,34 +532,114 @@ class PhysExpertMPMTrainer:
                 p_visc = gather_and_interp(visc_patch.unsqueeze(-1)).squeeze()
                 expert_params = {'mu': p_mu, 'lam': p_lam, 'fiber_k': p_fk, 'fiber_dir': p_fdir, 'yield_stress': p_yield, 'plastic_viscosity': p_visc}
 
+                # [FIX] Ensure intermediate expert tensors can receive gradients from Warp Tape
+                # Move this BEFORE torch2warp calls to avoid UserWarning in Warp's wp.from_torch
+                if self.use_warp:
+                    if p_weights.requires_grad: p_weights.retain_grad()
+                    if p_mu.requires_grad: p_mu.retain_grad()
+                    if p_lam.requires_grad: p_lam.retain_grad()
+                    if p_fk.requires_grad: p_fk.retain_grad()
+                    if p_fdir.requires_grad: p_fdir.retain_grad()
+
+                # [NEW] Pre-convert expert parameters to Warp arrays ONCE per frame
+                # This ensures tape.backward() accumulates gradients into these arrays correctly
+                # across all sub-steps.
+                active_experts_list = getattr(self.cfg.mpm, 'active_experts', ['nh', 'co', 'st', 'fi'])
+                expert_order = ['nh', 'co', 'st', 'fi']
+                mask_active = [1 if e in active_experts_list else 0 for e in expert_order]
+                active_mask_wp = wp.array(mask_active, dtype=wp.int32, device=self.simulator.warp_device)
+                
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    moe_params_wp = {
+                        'weights': torch2warp_float(p_weights, requires_grad=True),
+                        'mu': torch2warp_float(p_mu, requires_grad=True),
+                        'lam': torch2warp_float(p_lam, requires_grad=True),
+                        'fk': torch2warp_float(p_fk, requires_grad=True),
+                        'fdir': torch2warp_vec3(p_fdir, requires_grad=True),
+                        'active_mask': active_mask_wp
+                    }
+                
+                # Store for gradient extraction step
+                self.simulator.last_moe_params = moe_params_wp
+                self.simulator.last_expert_inputs = {
+                    'weights': p_weights,
+                    'mu': p_mu,
+                    'lam': p_lam,
+                    'fk': p_fk,
+                    'fdir': p_fdir
+                }
+
                 c_pos_end = self.controller_points[t]
                 c_pos_start = self.controller_points[t-1] if t > 0 else c_pos_end
                 
                 v_ctrl_t = (c_pos_end - c_pos_start) / (self.cfg.mpm.dt * self.cfg.mpm.steps_per_frame)
 
                 # Controller Stiffness Warm-up
-                orig_stiffness = getattr(self.cfg.mpm, 'controller_stiffness', 1000.0)
+                # [FIX] Read from base config to avoid exponential decay across iterations
+                base_stiffness = getattr(self.cfg.mpm, 'controller_stiffness', 1000.0)
                 warmup_frames = getattr(self.cfg.mpm, 'controller_warmup_frames', 10)
-                current_stiffness = orig_stiffness * min(1.0, (t + 1) / (warmup_frames + 1e-6))
-                self.simulator.cfg.controller_stiffness = current_stiffness
+                current_stiffness = base_stiffness * min(1.0, (t + 1) / (warmup_frames + 1e-6))
 
                 # [SCHEME A] Phase 1: Pure MPM Physics Solver Loop
                 # Start of frame position
                 x_start_frame = (self.simulator.x - self.simulator.shift).detach().unsqueeze(0)
 
+                # [NEW] Pre-calculate adaptive damping for this frame (optional: could be per-step)
+                # To save computation, we update damping every K sub-steps
+                K_damping = getattr(self.cfg.residual, 'damping_interval', 20)
+                current_damping = None
+                frame_damping_loss = 0.0 # [NEW] Reset for each frame
+                
+                # [WARMUP] Override res_mode if in warmup phase
+                res_mode = getattr(self.cfg.residual, 'mode', 'both')
+                if i < getattr(self.cfg.residual, 'warmup_iters', 5):
+                    res_mode = 'none'
+
+                # Only record the last K sub-steps on tape to prevent gradient explosion
+                # through hundreds of chained P2G2P steps (standard in differentiable physics).
+                tape_window = min(getattr(self.cfg.mpm, 'tape_window', 5), self.cfg.mpm.steps_per_frame)
+                tape_start = self.cfg.mpm.steps_per_frame - tape_window
+
                 for s in range(self.cfg.mpm.steps_per_frame):
                     alpha = (s + 1) / self.cfg.mpm.steps_per_frame
                     curr_target_pos = c_pos_start + alpha * (c_pos_end - c_pos_start)
                     
-                    # residual_v is None during sub-steps in Scheme A
-                    x_curr = self.simulator.step(p_weights, expert_params, 
+                    # Enable tape only for the last few sub-steps
+                    if s < tape_start:
+                        self.simulator.tape = None
+                    else:
+                        self.simulator.tape = tape
+
+                    if self.residual_net is not None and s % K_damping == 0 and res_mode in ['damping', 'both']:
+                        x_his_tensor = torch.stack(x_history, dim=1).unsqueeze(0)
+                        v_his_tensor = torch.stack(v_history, dim=1).unsqueeze(0)
+                        curr_x_mpm = (self.simulator.x - self.simulator.shift).unsqueeze(0)
+                        curr_v_mpm = self.simulator.v.unsqueeze(0)
+                        
+                        current_damping = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor, mode="damping").squeeze(0)
+                        
+                        with torch.no_grad():
+                            res_stats['mean_damping'].append(current_damping.mean().item())
+                        
+                        damping_reg = torch.mean(current_damping**2) * getattr(self.cfg.residual, 'lambda_reg', 0.01) * 10.0
+                        frame_damping_loss += (damping_reg / self.cfg.mpm.steps_per_frame)
+
+                    x_curr = self.simulator.step(moe_params_wp, 
                                                  controller_pos=curr_target_pos, 
                                                  controller_vel=v_ctrl_t,
-                                                 residual_v=None)
-
+                                                 residual_v=None,
+                                                 damping_override=current_damping,
+                                                 stiffness_override=current_stiffness)
+                
                 # [SCHEME A] Phase 2: Neural Feedback Correction
                 delta_v = None
-                if self.residual_net is not None:
+                # Store the original leaf tensors from the simulator to avoid "non-leaf grad" warnings
+                # and ensure we pass the correct gradients back to Warp.
+                leaf_x = self.simulator.x
+                leaf_v = self.simulator.v
+
+                if self.residual_net is not None and res_mode in ['residual', 'both']:
                     # History [B, N, H, 3]
                     x_his_tensor = torch.stack(x_history, dim=1).unsqueeze(0)
                     v_his_tensor = torch.stack(v_history, dim=1).unsqueeze(0)
@@ -507,7 +649,8 @@ class PhysExpertMPMTrainer:
                     curr_v_mpm = self.simulator.v.unsqueeze(0)
                     
                     # Predict correction: Net(pos_mpm, vel_mpm, pos_start, history)
-                    delta_v = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor).squeeze(0)
+                    # [MODIFIED] Explicitly call with mode="residual"
+                    delta_v = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor, mode="residual").squeeze(0)
                     
                     # [NEW] Calculate monitoring metrics before applying
                     with torch.no_grad():
@@ -543,6 +686,9 @@ class PhysExpertMPMTrainer:
                     v_history.pop(0)
                     v_history.append(self.simulator.v.detach())
                 
+                # Track loss uses only the first num_supervised particles (surface with GT).
+                # init_pos order: [surface, other_surf, interior, (optional) dense, new_internal],
+                # so appended Gaussian particles do not affect loss indices.
                 x_curr_surf = x_curr[:num_supervised]
                 x_gt = gt_tracks[t]
                 
@@ -561,22 +707,115 @@ class PhysExpertMPMTrainer:
                     res_reg = 0.0
                     if delta_v is not None:
                         res_reg = torch.mean(delta_v**2) * getattr(self.cfg.residual, 'lambda_reg', 0.01)
-                    
-                    frame_loss = (track_loss * 1.0 + cham_loss * 1.0 + res_reg) / T
+                    render_loss = self.compute_optional_render_loss(i, t, x_curr)
+                    frame_loss = (track_loss * 1.0 + cham_loss * 1.0 + res_reg + frame_damping_loss + render_loss) / T
                 else:
                     # Fallback if the whole frame is empty (should not happen)
                     frame_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                 
                 # 如果出现 NaN/Inf，立即报错并停止
                 if not torch.isfinite(frame_loss):
-                    print(f"\n[ERROR] Non-finite loss ({frame_loss.item()}) detected in Frame {t}! Stopping.")
+                    tqdm.write(f"[ERROR] Non-finite loss ({frame_loss.item()}) detected in Frame {t}! Stopping.")
                     total_loss = float('nan')
                     break
 
-                # [ULTIMATE STABILITY] Frame-by-frame backward WITHOUT retain_graph.
-                # This is the only way to reliably run 666 sub-steps without OOM.
-                frame_loss.backward()
+                # [ULTIMATE STABILITY] Frame-by-frame backward.
+                # We use retain_graph=True because we need to backprop physics gradients
+                # through the same Residual Network graph in Step B.
+                frame_loss.backward(retain_graph=self.use_warp)
                 
+                # [NEW] Warp Backward Propagation
+                if self.use_warp and tape is not None:
+                    # Step A: Pass PyTorch gradients from leaf_x.grad and leaf_v.grad to Warp Tape
+                    # leaf_x.grad is populated by frame_loss.backward() as a leaf tensor.
+                    grads_dict = {}
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        if leaf_x.grad is not None:
+                            # [FIX] Detach gradient tensor to avoid "non-leaf grad" UserWarning in Warp
+                            grads_dict[self.simulator.solver.mpm_state.particle_x] = torch2warp_vec3(leaf_x.grad.detach())
+                        if leaf_v.grad is not None:
+                            grads_dict[self.simulator.solver.mpm_state.particle_v] = torch2warp_vec3(leaf_v.grad.detach())
+                    
+                    if len(grads_dict) > 0:
+                        if t < 3 and (i - start_iter) < 2:
+                            grad_x_norm = torch.norm(leaf_x.grad).item() if leaf_x.grad is not None else 0.0
+                            tqdm.write(f"  [DEBUG] Iter {i} Frame {t} Input Grad Norm: {grad_x_norm:.2e}, tape launches: {len(tape.launches)}")
+                        
+                        tape.backward(grads=grads_dict)
+                        
+                        # Sanitize NaN gradients from SVD backward instability
+                        for arr in tape.gradients.values():
+                            if not isinstance(arr, wp.array):
+                                continue
+                            t_arr = wp.to_torch(arr)
+                            nan_mask = torch.isnan(t_arr) | torch.isinf(t_arr)
+                            if nan_mask.any():
+                                t_arr[nan_mask] = 0.0
+                        
+                        if t < 3 and (i - start_iter) < 2:
+                            n_grads = len(tape.gradients)
+                            solver = self.simulator.solver
+                            s = solver.mpm_state
+                            checks = {
+                                'particle_x': s.particle_x,
+                                'particle_v': s.particle_v,
+                                'grid_v_out': s.grid_v_out,
+                                'grid_v_in': s.grid_v_in,
+                                'stress': s.particle_stress,
+                                'F_trial': s.particle_F_trial,
+                                'mu': self.simulator.last_moe_params.get('mu'),
+                            }
+                            parts = [f"grads_n={n_grads}"]
+                            for name, arr in checks.items():
+                                if arr is None: continue
+                                in_g = arr in tape.gradients
+                                if in_g:
+                                    g_arr = tape.gradients[arr]
+                                    g_norm = torch.norm(wp.to_torch(g_arr).float()).item()
+                                    parts.append(f"{name}:{g_norm:.2e}")
+                                else:
+                                    has_grad = arr.grad is not None and bool(arr.grad)
+                                    parts.append(f"{name}:NOT_IN(grad={has_grad})")
+                            tqdm.write(f"  [DIAG] {', '.join(parts)}")
+                        
+                        # Step B removed: ResidualPGND gets its gradient entirely from
+                        # frame_loss.backward() via the direct PyTorch path
+                        # (loss -> x_curr -> delta_v -> net_params). The tape gradient
+                        # on particle_v is for the tape-window boundary, not for delta_v
+                        # which is applied *after* all sub-steps. Injecting it via
+                        # delta_v.backward() corrupts the neural net's clean gradient.
+                        
+                        # Step C: Expert Parameter Gradient Extraction
+                        if hasattr(self.simulator, 'last_moe_params'):
+                            valid_tensors = []
+                            for key in ['weights', 'mu', 'lam', 'fk', 'fdir']:
+                                wp_array = self.simulator.last_moe_params.get(key)
+                                torch_tensor = self.simulator.last_expert_inputs.get(key)
+                                if wp_array is not None and torch_tensor is not None and torch_tensor.requires_grad:
+                                    grad_wp = tape.gradients.get(wp_array)
+                                    if grad_wp is not None:
+                                        valid_tensors.append((key, torch_tensor, grad_wp))
+                                    elif t == 0 and (i - start_iter) < 2:
+                                        tqdm.write(f"  [DIAG] tape.gradients missing for '{key}'")
+                            
+                            if t == 0 and (i - start_iter) < 2:
+                                tqdm.write(f"  [DIAG] valid_tensors count: {len(valid_tensors)}, tape.gradients keys: {len(tape.gradients)}")
+                            
+                            for j, (key, torch_tensor, grad_wp) in enumerate(valid_tensors):
+                                grad_torch = wp.to_torch(grad_wp).reshape(torch_tensor.shape)
+                                grad_torch = torch.nan_to_num(grad_torch, nan=0.0, posinf=0.0, neginf=0.0)
+                                is_last = (j == len(valid_tensors) - 1)
+                                if t == 0 and (i - start_iter) < 2:
+                                    tqdm.write(f"  [DIAG] '{key}' grad norm from tape: {torch.norm(grad_torch).item():.2e}")
+                                torch_tensor.backward(grad_torch, retain_graph=not is_last)
+                        
+                        # [FIX] If we reached here and use_warp is true, 
+                        # but no backward call was the "last" one (e.g. all None), 
+                        # the graph might still be sitting in memory. 
+                        # But frame-by-frame usually handles this when the loss tensor goes out of scope.
+                        pass
+
                 # [NEW] Log per-frame loss for debugging stability
                 # Using a separate tag for each iteration allows overlaying them in TensorBoard
                 # We only log every 1 iteration to see the curve.
@@ -616,32 +855,41 @@ class PhysExpertMPMTrainer:
                 
                 # 实时监控 E 和 nu
                 frame_pbar.set_postfix({
-                    'f_loss': f"{frame_loss.item() * T:.4f}",
+                    'f_loss': f"{frame_loss.item() * T:.6f}",
                     'E': f"{E_patch.mean().item():.1e}",
                     'nu': f"{nu_patch.mean().item():.3f}"
                 })
 
 
-            # --- Gradient Clipping ---
-            # [STABILITY] Include ALL learnable parameters (Physics + Neural) in clipping
-            all_params = [self.log_weights, self.raw_E, self.raw_nu, self.raw_fiber_k, self.raw_fiber_dir, self.raw_yield, self.raw_viscosity]
-            if self.residual_net is not None:
-                all_params.extend(list(self.residual_net.parameters()))
-                
-            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.1)
+            # --- Gradient Clipping (SEPARATE for physics vs neural) ---
+            # Physics params have tape-amplified gradients (~1e6); neural net has
+            # clean but tiny gradients. Clipping them together kills the neural signal.
+            phys_params = [self.log_weights, self.raw_E, self.raw_nu, self.raw_fiber_k, self.raw_fiber_dir, self.raw_yield, self.raw_viscosity]
+            phys_clip = getattr(self.cfg.mpm, 'grad_clip_norm', 0.1)
+            phys_grad_norm = torch.nn.utils.clip_grad_norm_(phys_params, max_norm=phys_clip)
             
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm) or grad_norm == 0:
-                print(f"\n[WARNING] Invalid gradient norm ({grad_norm}) in Iter {i+1}! Skipping.")
+            res_grad_norm = torch.tensor(0.0)
+            if self.residual_net is not None:
+                res_clip = getattr(self.cfg.residual, 'grad_clip_norm', 1.0)
+                res_grad_norm = torch.nn.utils.clip_grad_norm_(self.residual_net.parameters(), max_norm=res_clip)
+            
+            grad_norm = phys_grad_norm
+            
+            if torch.isnan(phys_grad_norm) or torch.isinf(phys_grad_norm) or phys_grad_norm == 0:
+                param_status = []
+                for name, p in [('weights', self.log_weights), ('E', self.raw_E), ('nu', self.raw_nu), ('fk', self.raw_fiber_k)]:
+                    g_norm = torch.norm(p.grad).item() if p.grad is not None else -1.0
+                    param_status.append(f"{name}:{g_norm:.1e}")
+                tqdm.write(f"[WARNING] Invalid phys gradient norm ({phys_grad_norm}) in Iter {i+1}! Params: {', '.join(param_status)}. Skipping.")
                 self.optimizer.zero_grad()
             else:
-                # [DEBUG] 使用本次 Iter 最后一帧计算的物理参数进行日志记录
                 with torch.no_grad():
                     w_mean = w_patch.mean(dim=0).tolist()
                     w_str = ", ".join([f"{self.active_experts[j]}:{w_mean[j]:.3f}" for j in range(len(self.active_experts))])
-                    print(f"\n[DEBUG] Iter {i+1} Grad Norm: {grad_norm:.2e}")
-                    print(f"        Mean E: {E_patch.mean().item():.2e}, Mean nu: {nu_patch.mean().item():.3f}")
-                    print(f"        Mean Mu: {mu_patch.mean().item():.2f}, Mean Lam: {lam_patch.mean().item():.2f}")
-                    print(f"        Mean Weights: [{w_str}]")
+                    tqdm.write(f"[DEBUG] Iter {i+1} Phys Grad: {phys_grad_norm:.2e}, Res Grad: {res_grad_norm:.2e}")
+                    tqdm.write(f"        Mean E: {E_patch.mean().item():.2e}, Mean nu: {nu_patch.mean().item():.3f}")
+                    tqdm.write(f"        Mean Mu: {mu_patch.mean().item():.2f}, Mean Lam: {lam_patch.mean().item():.2f}")
+                    tqdm.write(f"        Mean Weights: [{w_str}]")
                 self.optimizer.step()
                 
                 # [FIXED] Only step scheduler if the optimizer actually stepped
@@ -650,6 +898,10 @@ class PhysExpertMPMTrainer:
                 
                 for group_idx, param_group in enumerate(self.optimizer.param_groups):
                     self.writer.add_scalar(f'LR/Group_{group_idx}', param_group['lr'], i)
+
+            self.writer.add_scalar('GradNorm/Physics', phys_grad_norm.item(), i)
+            if self.residual_net is not None:
+                self.writer.add_scalar('GradNorm/Residual', res_grad_norm.item(), i)
 
             total_loss_val = total_loss if isinstance(total_loss, float) else total_loss.item()
             current_iter_loss = total_loss_val * T
@@ -676,7 +928,7 @@ class PhysExpertMPMTrainer:
                 prev_best = min(self.loss_history[:-patience])
                 
                 if (prev_best - recent_best) < min_delta:
-                    print(f"\n[EARLY STOP] No significant improvement for {patience} iters in this session. Best loss: {recent_best:.6f}. Stopping.")
+                    tqdm.write(f"[EARLY STOP] No significant improvement for {patience} iters in this session. Best loss: {recent_best:.6f}. Stopping.")
                     break
 
             # --- [NEW] 记录残差模块的贡献指标 ---
@@ -686,8 +938,12 @@ class PhysExpertMPMTrainer:
                 self.writer.add_scalar('Residual/Correction_to_Physics_Ratio', np.mean(res_stats['ratio_to_phys']), i)
                 self.writer.add_scalar('Residual/Cosine_Similarity', np.mean(res_stats['cos_sim']), i)
                 
-                # 记录最后一次计算的 delta_v 直方图
-                self.writer.add_histogram('Residual/Delta_V_Distribution', delta_v.detach().cpu().numpy(), i)
+                # [NEW] 记录自适应阻尼指标
+                if len(res_stats['mean_damping']) > 0:
+                    self.writer.add_scalar('Residual/Mean_Damping', np.mean(res_stats['mean_damping']), i)
+                
+                if delta_v is not None:
+                    self.writer.add_histogram('Residual/Delta_V_Distribution', delta_v.detach().cpu().numpy(), i)
 
             # 记录平均参数到 TensorBoard
             self.writer.add_scalar('Params/E_Mean', E_patch.mean().item(), i)
@@ -717,21 +973,15 @@ class PhysExpertMPMTrainer:
                 self.best_loss = current_total_loss
                 best_path = os.path.join(self.cfg.output_dir, self.scene_id, "best_checkpoint.pt")
                 self.save_checkpoint(best_path, iter=i+1)
-                # Also save the results pkl for convenience
-                self.save_results(os.path.join(self.cfg.output_dir, self.scene_id, "best_optimized_params.pkl"))
-                print(f"[BEST] New best loss: {self.best_loss:.6f} at Iter {i+1}. Saved to {best_path}")
+                tqdm.write(f"[BEST] New best loss: {self.best_loss:.6f} at Iter {i+1}. Saved to {best_path}")
 
             if (i+1) % 5 == 0:
-                self.save_results(os.path.join(self.log_dir, f"params_iter_{i+1}.pkl"))
-                # [NEW] Save full checkpoint for resumption
                 self.save_checkpoint(os.path.join(self.log_dir, f"checkpoint_iter_{i+1}.pt"), iter=i+1)
 
-        final_path = os.path.join(self.cfg.output_dir, self.scene_id, "optimized_params.pkl")
-        self.save_results(final_path)
-        # [NEW] Save final checkpoint
-        self.save_checkpoint(os.path.join(self.cfg.output_dir, self.scene_id, "final_checkpoint.pt"), iter=last_iter)
+        final_checkpoint_path = os.path.join(self.cfg.output_dir, self.scene_id, "final_checkpoint.pt")
+        self.save_checkpoint(final_checkpoint_path, iter=last_iter)
         
-        print(f"MPM Training Finished! Saved to {final_path}")
+        print(f"MPM Training Finished! Saved checkpoint to {final_checkpoint_path}")
         
         # --- [NEW] Qualitative Visualization ---
         print(f"Generating visualization video for {self.scene_id}...")
@@ -832,6 +1082,9 @@ class PhysExpertMPMTrainer:
         """
         Run one final simulation and save as a video.
         """
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
         # 1. Setup for final run
         self.simulator.eval()
         
@@ -863,17 +1116,32 @@ class PhysExpertMPMTrainer:
         # 2. Run Simulation
         self.simulator.reset(init_pos, controller_pos=controller_points[0])
         
+        # Build moe_params_wp (same format as training loop)
+        expert_order = ['nh', 'co', 'st', 'fi']
+        active_experts_list = getattr(self.cfg.mpm, 'active_experts', expert_order)
+        mask_active = [1 if e in active_experts_list else 0 for e in expert_order]
+        active_mask_wp = wp.array(mask_active, dtype=wp.int32, device=self.simulator.warp_device)
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            moe_params_wp = {
+                'weights': torch2warp_float(p_weights),
+                'mu': torch2warp_float(p_mu),
+                'lam': torch2warp_float(p_lam),
+                'fk': torch2warp_float(p_fk),
+                'fdir': torch2warp_vec3(p_fdir),
+                'active_mask': active_mask_wp
+            }
+        
         # [NEW] Initialize History Buffers for ResidualPGND
         H = getattr(self.cfg.residual if hasattr(self.cfg, 'residual') else None, 'n_history', 2)
         x_history = [init_pos.clone() for _ in range(H)]
         v_history = [torch.zeros_like(init_pos) for _ in range(H)]
 
-        # Note: self.simulator.current_friction is already set from config via __init__
         T_data = controller_points.shape[0]
         T = min(T_data, self.cfg.mpm.max_frames) if self.cfg.mpm.max_frames > 0 else T_data
         
-        temp_dir = os.path.join(os.path.dirname(output_path), "temp_frames")
-        os.makedirs(temp_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="temp_frames_", dir=output_dir)
         
         frames = []
         with torch.no_grad():
@@ -884,21 +1152,31 @@ class PhysExpertMPMTrainer:
                 v_ctrl_t = (c_pos_end - c_pos_start) / (self.cfg.mpm.dt * self.cfg.mpm.steps_per_frame)
 
                 # [SCHEME A] Phase 1: Pure MPM Physics Solver Loop
-                # Start of frame position
                 x_start_frame = (self.simulator.x - self.simulator.shift).detach().unsqueeze(0)
+
+                K_damping = getattr(self.cfg.residual, 'damping_interval', 20)
+                current_damping = None
+                res_mode = getattr(self.cfg.residual, 'mode', 'both')
 
                 for s in range(self.cfg.mpm.steps_per_frame):
                     alpha = (s + 1) / self.cfg.mpm.steps_per_frame
                     curr_target_pos = c_pos_start + alpha * (c_pos_end - c_pos_start)
                     
-                    # residual_v is None during sub-steps in Scheme A
-                    x_curr = self.simulator.step(p_weights, expert_params, 
+                    if self.residual_net is not None and s % K_damping == 0 and res_mode in ['damping', 'both']:
+                        x_his_tensor = torch.stack(x_history, dim=1).unsqueeze(0)
+                        v_his_tensor = torch.stack(v_history, dim=1).unsqueeze(0)
+                        curr_x_mpm = (self.simulator.x - self.simulator.shift).unsqueeze(0)
+                        curr_v_mpm = self.simulator.v.unsqueeze(0)
+                        current_damping = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor, mode="damping").squeeze(0)
+
+                    x_curr = self.simulator.step(moe_params_wp, 
                                                  controller_pos=curr_target_pos, 
                                                  controller_vel=v_ctrl_t,
-                                                 residual_v=None)
+                                                 residual_v=None,
+                                                 damping_override=current_damping)
                 
                 # [SCHEME A] Phase 2: Neural Feedback Correction
-                if self.residual_net is not None:
+                if self.residual_net is not None and res_mode in ['residual', 'both']:
                     # Set to eval mode just in case
                     self.residual_net.eval()
                     
@@ -911,7 +1189,8 @@ class PhysExpertMPMTrainer:
                     curr_v_mpm = self.simulator.v.unsqueeze(0)
                     
                     # Predict correction
-                    delta_v = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor).squeeze(0)
+                    # [MODIFIED] Explicitly call with mode="residual"
+                    delta_v = self.residual_net(curr_x_mpm, curr_v_mpm, x_start_frame, x_his_tensor, v_his_tensor, mode="residual").squeeze(0)
                     
                     # Apply correction to Simulator State
                     self.simulator.v = self.simulator.v + delta_v
@@ -1077,7 +1356,7 @@ class PhysExpertMPMTrainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None
         }
         torch.save(checkpoint, path)
-        print(f"[CHECKPOINT] Full training state saved to {path}")
+        tqdm.write(f"[CHECKPOINT] Full training state saved to {path}")
 
     def save_results(self, path):
         w, mu, lam, fk, fdir, friction, ys, E, nu, visc = self.get_current_phys_props()

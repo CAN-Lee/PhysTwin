@@ -1,10 +1,9 @@
 
 import torch
 import torch.nn as nn
-from mpm_pytorch.constitutive_models import Elasticity, Plasticity
 from ...utils.mpm_utils import apply_plasticity_return_mapping
 
-class HenckyViscoPlasticity(Plasticity):
+class HenckyViscoPlasticity(nn.Module):
     """
     Standard Hencky-strain based Viscoplasticity (Return Mapping).
     Inheriting from Plasticity allows it to be used as a formal state correction module.
@@ -23,7 +22,7 @@ class HenckyViscoPlasticity(Plasticity):
         """
         return apply_plasticity_return_mapping(F, mu, yield_stress, viscosity, dt)
 
-class NeoHookeanElasticity(Elasticity):
+class NeoHookeanElasticity(nn.Module):
     """
     Standard Neo-Hookean Model (Expert A)
     Psi = 0.5 * mu * (I1 - 3) - mu * ln(J) + 0.5 * lam * (ln(J))^2
@@ -35,7 +34,7 @@ class NeoHookeanElasticity(Elasticity):
     def _safe_F(self, F):
         # [STABILITY] SVD clamping to prevent numerical explosions
         U, S, Vh = torch.linalg.svd(F + torch.eye(3, device=F.device, dtype=F.dtype) * 1e-5)
-        S_clamped = torch.clamp(S, min=0.3, max=self.svd_clamp_max)
+        S_clamped = torch.clamp(S, min=0.05, max=self.svd_clamp_max)
         return torch.matmul(U, torch.matmul(torch.diag_embed(S_clamped), Vh))
 
     def forward(self, F: torch.Tensor, mu: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
@@ -53,7 +52,7 @@ class NeoHookeanElasticity(Elasticity):
         
         # [STABILITY] Robust determinant - relaxed for cloth compression
         detF = torch.det(F_stab)
-        J = torch.clamp(detF, min=0.1, max=10.0).unsqueeze(-1).unsqueeze(-1) # [..., 1, 1]
+        J = torch.clamp(detF, min=0.01, max=10.0).unsqueeze(-1).unsqueeze(-1) # [..., 1, 1]
         
         # P = mu * (F - F^-T) + lam * ln(J) * F^-T
         lnJ = torch.log(J)
@@ -67,7 +66,7 @@ class NeoHookeanElasticity(Elasticity):
         P = torch.clamp(P, min=-1e5, max=1e5)
         return P
 
-class FiberElasticity(Elasticity):
+class FiberElasticity(nn.Module):
     """
     Anisotropic Fiber Model (Expert D)
     Psi = 0.5 * k * (|Fd| - 1)^2 (only if extended)
@@ -79,7 +78,7 @@ class FiberElasticity(Elasticity):
     def _safe_F(self, F):
         # [STABILITY] SVD clamping
         U, S, Vh = torch.linalg.svd(F + torch.eye(3, device=F.device, dtype=F.dtype) * 1e-5)
-        S_clamped = torch.clamp(S, min=0.3, max=self.svd_clamp_max)
+        S_clamped = torch.clamp(S, min=0.05, max=self.svd_clamp_max)
         return torch.matmul(U, torch.matmul(torch.diag_embed(S_clamped), Vh))
 
     def forward(self, F: torch.Tensor, k: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
@@ -111,7 +110,7 @@ class FiberElasticity(Elasticity):
         P = scalar * torch.matmul(F_clamped, ddT)
         return torch.clamp(P, min=-2e5, max=2e5) # [STABILITY] Clamp fiber stress
 
-class MixtureElasticity(Elasticity):
+class MixtureElasticity(nn.Module):
     """
     The Master Constitutive Model that blends experts based on configuration.
     """

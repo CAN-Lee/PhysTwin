@@ -133,7 +133,7 @@ class MPMSimulator(nn.Module):
             self.initial_offsets = None
             self.num_connections = 0
 
-    def step(self, expert_weights, expert_params, controller_pos=None, controller_vel=None, residual_v=None):
+    def step(self, expert_weights, expert_params, controller_pos=None, controller_vel=None, residual_v=None, damping_override=None):
         """
         Execute one MPM step with optional controller forces and neural residuals.
         Args:
@@ -142,6 +142,7 @@ class MPMSimulator(nn.Module):
             controller_pos: [N_ctrl, 3] current controller positions (original coordinate system)
             controller_vel: [N_ctrl, 3] current controller velocities (original coordinate system)
             residual_v: [N_sim, 3] (Optional) velocity residual from PGND
+            damping_override: [N_sim, 1] (Optional) per-particle damping from PGND
         """
         # 1. Apply Controller PD Forces (before MPM update)
         if self.controller_indices is not None and controller_pos is not None:
@@ -233,6 +234,11 @@ class MPMSimulator(nn.Module):
         damping = getattr(self.cfg, 'damping', 0.0)
         if damping > 0:
             self.v = self.v * (1.0 - damping * self.cfg.dt)
+            
+        # [NEW] Apply neural adaptive damping if provided
+        if damping_override is not None:
+            # damping_override is expected to be [N, 1] in [0, 1]
+            self.v = self.v * (1.0 - damping_override)
             
         # Ensure particles stay within boundaries
         # Note: self.x is shifted [0.5, 0.5, 0.5], keep it within [0.1, 0.9] to avoid grid edges

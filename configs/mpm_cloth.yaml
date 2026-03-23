@@ -1,40 +1,52 @@
 # Output settings
-output_dir: './output_3/cloth'
-tag: 'cloth_lift_moe'
+output_dir: './output_3/cloth_warp'
+tag: 'cloth'
 
 # [NEW] Target Scenes Filter
 # If provided, only these scenes will be trained
 target_scenes: 
   - "double_lift_cloth_1"
-  # - "single_clift_cloth_1"
-  # - "single_clift_cloth_3"
+  - "double_lift_cloth_3"
+  - "single_clift_cloth_1"
+  - "single_clift_cloth_3"
+  - "single_lift_cloth"
+  - "single_lift_cloth_1"
+  - "single_lift_cloth_3"
+  - "single_lift_cloth_4"
 
 # Data Config
 data:
   root: './data/different_types' # Point to real data root
   reverse_z: true                # Flip Z axis to match physical gravity and boundary
-  
+  # Gaussian filling: add new_internal (and optionally dense) to MPM init_pos when PLY exists
+  # 布料是薄片，不需要体积填充（Gaussian 填充会人为增加厚度导致分层）
+  # gaussian_output_dir: './gaussian_output'
+  # gaussian_grid_n: 96
+  # gaussian_density_thres: 0.8    
+  # gaussian_search_thres: 0.3
+  # gaussian_max_particles_per_cell: 3
 
-  # 2. Optimization Config
+# 2. Optimization Config
 train:
-  lr_params: 1e-3    # 2e-4 [STABILITY] Further reduced to prevent over-shooting good parameters
-  iters: 50          # [INCREASED] Since we have early stopping now
+  lr_params: 1e-3
+  iters: 200
   batch_size: 1
-  gpus: '4'
-  num_workers: 1
+  gpus: '5,6,7'
+  num_workers: 3
   lambda_track: 1.0
   lambda_chamfer: 1.0
   lambda_vel: 0.1
   lambda_smooth: 0.1
-  lambda_sparse: 0.05  # Slightly higher sparsity for cloth (distinct fiber/elastic regions)
+  lambda_sparse: 0.05
   # Early Stopping Config
-  early_stop_patience: 10 # 连续多少次没有显著改进则停止
-  early_stop_min_delta: 1e-4 # 最小改进阈值
+  early_stop_patience: 20 # 连续多少次没有显著改进则停止
+  early_stop_min_delta: 1e-5 # 最小改进阈值
 
 # 3. MPM Simulation Config
 mpm:
+  use_warp: true
   device: 'cuda'
-  n_particles: 5000 
+  n_particles: 100000 
   dt: 1e-4           # [RESTORED] Original time step
   grid_res: 32       
   
@@ -44,36 +56,40 @@ mpm:
   # [NEW] Initial Expert Weights (Softmax-ready probabilities)
   init_weights: [0.3, 0.1, 0.1, 0.5]
 
-  # [NEW] SVD Clamping Upper Bound
-  svd_clamp_max: 4.0 # [STABILITY] Balanced between 3.0 and 5.0
+  tape_window: 5          # Warp tape 只记录每帧最后 N 个子步骤，防止长链梯度爆炸
+  grad_clip_norm: 0.1     # 物理参数(E/nu/weights等)的梯度裁剪阈值，独立于神经网络
+  svd_clamp_max: 2.0
   
+  floor_margin: 0.0      # 布料平铺在桌面，地面完全紧贴底部（软体用0.05留间隙）
   gravity: [0.0, 0.0, -9.8] 
-  damping: 10.0       # [BALANCED] 5.0 might be too slippery
+  damping: 20.0       # [BALANCED] 5.0 might be too slippery
   grid_v_damping_scale: 0.999 
   clip_bound: 0.5
   
   # Initial values for raw_params (log-space mapping)
   init_raw_params: -1.0 
-  init_raw_E: -1.0       # [FIRM START] Ensures force propagates from corners to center
-  init_raw_fiber_k: 1.0  
+  init_raw_E: 0.0        # sigmoid(0)=0.5 → E≈3.2e4 Pa (bounds几何中心，适合织物)
+  init_raw_fiber_k: 1.0  # sigmoid(1)=0.73 → fiber_k≈1.6e6 Pa (布料纤维抗拉主导)
   init_raw_yield: 0.0    
   
   # Material Parameter Optimization Bounds
+  # 布料比毛绒玩具更薄更柔，E 和 fiber_k 的范围应更低
   material_bounds:
-    E: [2e4, 1e8]       # [SOFTEN] Reduced floor from 5e4 to 1e4 to allow more bending
+    E: [1e4, 1e7]        # 布料刚度提高：10kPa(薄布)~10MPa(厚帆布)
     nu: [0.0, 0.45]     
-    yield_stress: [2e5, 1e8] # [SOFTEN] Reduced floor from 5e5 to 1e5
+    yield_stress: [1e4, 1e7]
     plastic_viscosity: [0.1, 10.0] 
-    fiber_k: [2e5, 1e9] # [SOFTEN] Reduced floor from 5e5 to 1e5 to allow extension/bending 
+    fiber_k: [1e4, 1e7]  # 布料纤维抗拉：10kPa~10MPa
   
   # Parameter-level Learning Rate Ranges [start, end]
+  # 与 softbody 保持同一量级，避免 tape 梯度 (~1e6) 导致发散
   lr_ranges:
-    E: [0.1, 0.001]
-    nu: [0.1, 0.001]
-    yield_stress: [0.01, 0.0001]     
-    plastic_viscosity: [0.01, 0.0001] 
-    fiber_k: [0.01, 0.0001]      
-    fiber_dir: [0.001, 0.00001]  
+    E: [1e-3, 1e-5]
+    nu: [1e-3, 1e-5]
+    yield_stress: [1e-3, 1e-5]     
+    plastic_viscosity: [1e-3, 1e-5] 
+    fiber_k: [1e-3, 1e-5]      
+    fiber_dir: [1e-4, 1e-6]  
     log_weights: [1e-3, 1e-5]
   
   # [NEW] Staged Optimization
@@ -86,11 +102,11 @@ mpm:
   steps_per_frame: 333 
   
   # Controller Interaction Config (Target Acceleration Mode)
-  controller_stiffness: 150000.0   # [REVISED] Increased to compensate for fewer particles
+  controller_stiffness: 60000.0   # [REVISED] Increased to compensate for fewer particles
   controller_damping: 5000.0       
-  controller_radius: 0.10          # [PRECISION] Reduced to only grab corners, not the center
-  controller_max_neighbors: 128    # [REVISED] 
-  controller_clamp_dv: 2.0         # Max velocity change per step
+  controller_radius: 0.08          # [PRECISION] Reduced to only grab corners, not the center
+  controller_max_neighbors: 64    # [REVISED] 
+  controller_clamp_dv: 0.3         # Max velocity change per step
   controller_smooth_window: 2   
   controller_warmup_frames: 3
   
@@ -107,7 +123,11 @@ mpm:
 
 # 4. Residual PGND Config
 residual:
-  lr: 5e-4              # 残差网络的学习率 
+  mode: 'residual' # "residual", "damping", "both"
+  warmup_iters: 5   # 物理参数受 tape 截断限制学不动，让 ResidualPGND 从一开始就参与修正
+  # damping_interval: 333 # [STABILITY] Sync with steps_per_frame to update once per frame
+  lr: 1e-3
+  grad_clip_norm: 1.0   # ResidualPGND 的梯度裁剪阈值，独立于物理参数
   feature_dim: 64       # PointNet 提取的特征维度
   radius: 0.05          # [已弃用] 原 P2G 搜索半径，现已被 B-Spline 取代
   n_history: 3          # 输入网络的时间步历史长度 (H)
@@ -116,5 +136,41 @@ residual:
   num_layers: 4         # 解码器 MLP 的层数
   hidden_size: 128      # 隐藏层神经元数量
   input_scale: 1.0      # 输入特征 (速度/位移) 的缩放比例
-  output_scale: 0.5     # 残差输出的最大幅值截断 (基于 tanh的输出值，再乘以output_scale) 0.3->0.5
-  lambda_reg: 0.001     # 残差 L2 正则化权重，用于约束修正强度 0.005->0.001
+  output_scale: 0.3     # 残差输出的最大幅值截断 (基于 tanh的输出值，再乘以output_scale) 0.3->0.5
+  lambda_reg: 0.005     # 残差 L2 正则化权重，用于约束修正强度 0.005->0.001
+
+bridge:
+  enabled: true
+  gaussian_root: './gaussian_output'
+  gaussian_exp_name: 'auto_latest'
+  inference_dir: './output_3/mpm_inference'
+  num_render_anchors: 4096
+  anchor_particle_k: 16
+  anchor_graph_k: 8
+  gaussian_anchor_k: 8
+  anchor_particle_temp: 0.01
+  max_pos_residual: 0.005
+  max_opacity_delta: 0.5
+  residual_hidden_size: 128
+  residual_layers: 3
+  stage1_global_optimization: true
+  stage1_shuffle_train_samples: true
+  stage1_val_max_samples: 0
+  stage1_iters: 50
+  stage2_iters: 20
+  stage1_lr_static: 1e-3
+  stage1_lr_residual: 1e-3
+  stage2_lr: 1e-4
+  stage1_grad_clip_norm: 1.0
+  joint_warmup_iters: 10
+  render_frame_stride: 10
+  lambda_dssim: 0.2
+  lambda_rgb: 1.0
+  lambda_mask: 0.5
+  lambda_bind: 1e-4
+  lambda_weight_sparse: 1e-4
+  lambda_res_pos: 1e-4
+  lambda_res_opacity: 1e-4
+  lambda_res_temporal: 1e-4
+  lambda_render_joint: 0.05
+  eval_every: 5

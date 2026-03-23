@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PhysTwin MPM — 网页拖拽</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; overflow: hidden; }
+    #bar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+      padding: 10px 16px; background: rgba(22,27,34,0.95); border-bottom: 1px solid #30363d;
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px;
+    }
+    #bar button {
+      background: #238636; color: #fff; border: none; padding: 8px 14px; border-radius: 6px;
+      cursor: pointer; font-weight: 600;
+    }
+    #bar button:hover { background: #2ea043; }
+    #bar button.secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+    #bar button.secondary:hover { background: #30363d; }
+    #status { color: #8b949e; flex: 1; min-width: 200px; }
+    #status.err { color: #f85149; }
+    #legend {
+      display: flex; gap: 14px; align-items: center; font-size: 12px; color: #8b949e;
+    }
+    #legend span { display: flex; align-items: center; gap: 6px; }
+    #legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <button type="button" id="btnConnect">连接服务器</button>
+    <button type="button" id="btnReset" class="secondary" disabled>重置物体</button>
+    <span id="status">点击连接（首次重置会重力松弛到地面，可能需数十秒）</span>
+    <div id="legend">
+      <span><i style="background:#ffd60a; box-shadow:0 0 6px #ffd60a"></i> Action（控制器）</span>
+      <span><i style="background:#ff6b35"></i> 被连接粒子（PD 弹簧）</span>
+    </div>
+  </div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const defaultWs = `${wsProto}//${location.host}/ws`;
+
+    /**
+     * PhysTwin MPM: 重力沿 -Z，地面在 XY 平面（Z 为竖直）。
+     * Three.js：地面在 XZ，Y 朝上。必须映射，否则网格与「地面」不对齐。
+     * three = (sim.x, sim.z, -sim.y)
+     */
+    function simToThreeBuf(out, src, n) {
+      for (let i = 0; i < n; i++) {
+        const sx = src[i * 3];
+        const sy = src[i * 3 + 1];
+        const sz = src[i * 3 + 2];
+        out[i * 3] = sx;
+        out[i * 3 + 1] = sz;
+        out[i * 3 + 2] = -sy;
+      }
+    }
+    function simToThreePoint(p) {
+      return [p[0], p[2], -p[1]];
+    }
+    /** 拖拽目标 Three → 发回服务端 sim */
+    function threeToSim(v) {
+      return { x: v.x, y: -v.z, z: v.y };
+    }
+
+    let ws = null;
+    let indexStride = 1;
+    let points = null;
+    let positions = null;
+    let nParticles = 0;
+    let grabbing = false;
+    const grabWorld = new THREE.Vector3();
+    const dragPlane = new THREE.Plane();
+    const dragTarget = new THREE.Vector3();
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points.threshold = 0.04;
+
+    const connectedSet = new Set();
+    const actionSpheres = [];
+    const connSpheres = [];
+    const sphereGeo = new THREE.SphereGeometry(0.022, 20, 20);
+    const connGeo = new THREE.SphereGeometry(0.014, 12, 12);
+    const connMat = new THREE.MeshStandardMaterial({
+      color: 0xff4422, emissive: 0x881100, emissiveIntensity: 0.35, metalness: 0.15, roughness: 0.4,
+    });
+    const actionMat = new THREE.MeshStandardMaterial({
+      color: 0xffd60a, emissive: 0xaa7700, emissiveIntensity: 0.45, metalness: 0.2, roughness: 0.35,
+    });
+    const actionLight = new THREE.PointLight(0xffd60a, 1.15, 0.85);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d1117);
+    scene.add(actionLight);
+
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.001, 50);
+    camera.position.set(0.55, 0.45, 0.55);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.08, 0);
+
+    const grid = new THREE.GridHelper(1.2, 24, 0x30363d, 0x21262d);
+    grid.position.y = -0.01;
+    scene.add(grid);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+    dir.position.set(1, 2, 1);
+    scene.add(dir);
+    const statusEl = document.getElementById('status');
+    function setStatus(t, err) {
+      statusEl.textContent = t;
+      statusEl.className = err ? 'err' : '';
+    }
+
+    function updateActionVisual(ctrlList) {
+      while (actionSpheres.length) {
+        scene.remove(actionSpheres.pop());
+      }
+      if (!ctrlList || !ctrlList.length) {
+        actionLight.visible = false;
+        return;
+      }
+      actionLight.visible = true;
+      for (const c of ctrlList) {
+        const t = simToThreePoint(c);
+        const m = new THREE.Mesh(sphereGeo, actionMat);
+        m.position.set(t[0], t[1], t[2]);
+        scene.add(m);
+        actionSpheres.push(m);
+      }
+      const t0 = simToThreePoint(ctrlList[0]);
+      actionLight.position.set(t0[0], t0[1], t0[2]);
+    }
+
+    function applyVertexColors() {
+      if (!points || !positions) return;
+      const col = points.geometry.attributes.color.array;
+      const stride = indexStride;
+      for (let i = 0; i < nParticles; i++) {
+        const pid = i * stride;
+        if (connectedSet.has(pid)) {
+          col[i * 3] = 1.0;
+          col[i * 3 + 1] = 0.42;
+          col[i * 3 + 2] = 0.2;
+        } else {
+          const y = (positions[i * 3 + 1] + 0.25) * 0.4 + 0.35;
+          col[i * 3] = 0.28 + y * 0.45;
+          col[i * 3 + 1] = 0.48 + y * 0.28;
+          col[i * 3 + 2] = 0.82;
+        }
+      }
+      points.geometry.attributes.color.needsUpdate = true;
+    }
+
+    function updateConnMarkers(pts) {
+      while (connSpheres.length) scene.remove(connSpheres.pop());
+      if (!pts || !pts.length) return;
+      for (const p of pts) {
+        const t = simToThreePoint(p);
+        const m = new THREE.Mesh(connGeo, connMat);
+        m.position.set(t[0], t[1], t[2]);
+        scene.add(m);
+        connSpheres.push(m);
+      }
+    }
+
+    function applyFrameMeta(j) {
+      connectedSet.clear();
+      (j.connected || []).forEach((id) => connectedSet.add(id));
+      updateActionVisual(j.ctrl || []);
+      updateConnMarkers(j.connected_points || []);
+      const nc = j.connected ? j.connected.length : 0;
+      const na = j.ctrl ? j.ctrl.length : 0;
+      if (j.grabbing) {
+        setStatus(`拖拽中 · Action ${na} 点 · PD 弹簧连接 ${nc} 个粒子`);
+      } else if (na === 0 && nc === 0) {
+        setStatus('已加载贴地姿态 · 点选粒子拖拽');
+      }
+      applyVertexColors();
+    }
+
+    function applyPositions(buf) {
+      const view = new DataView(buf);
+      const n = view.getUint32(0, true);
+      const arr = new Float32Array(buf, 8, n * 3);
+      if (!points || nParticles !== n) {
+        nParticles = n;
+        if (points) scene.remove(points);
+        positions = new Float32Array(n * 3);
+        simToThreeBuf(positions, arr, n);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const cols = new Float32Array(n * 3);
+        geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+        const mat = new THREE.PointsMaterial({
+          size: 0.012,
+          vertexColors: true,
+          sizeAttenuation: true,
+          transparent: true,
+          opacity: 0.9,
+        });
+        points = new THREE.Points(geo, mat);
+        scene.add(points);
+      } else {
+        simToThreeBuf(positions, arr, n);
+        points.geometry.attributes.position.needsUpdate = true;
+      }
+      applyVertexColors();
+    }
+
+    function send(cmd, extra = {}) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ cmd, ...extra }));
+    }
+
+    document.getElementById('btnConnect').onclick = () => {
+      const url = prompt('WebSocket URL', defaultWs) || defaultWs;
+      if (ws) { ws.close(); ws = null; }
+      setStatus('连接中…');
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        setStatus('已连接，等待首帧（重力松弛中请稍候）…');
+        document.getElementById('btnReset').disabled = false;
+      };
+      ws.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer) {
+          applyPositions(ev.data);
+        } else {
+          try {
+            const j = JSON.parse(ev.data);
+            if (j.type === 'hello') {
+              indexStride = j.stride || 1;
+              setStatus(`已连接 · 粒子 ${j.n_total} · 显示 ${j.n_render} · stride=${indexStride} — 首次重置松弛中…`);
+              send('reset');
+            } else if (j.type === 'frame_meta') {
+              applyFrameMeta(j);
+            }
+            if (j.error) setStatus(j.error, true);
+          } catch (_) {}
+        }
+      };
+      ws.onerror = () => setStatus('WebSocket 错误', true);
+      ws.onclose = () => {
+        setStatus('已断开');
+        document.getElementById('btnReset').disabled = true;
+        connectedSet.clear();
+        updateActionVisual([]);
+        updateConnMarkers([]);
+        actionLight.visible = false;
+      };
+    };
+
+    document.getElementById('btnReset').onclick = () => {
+      grabbing = false;
+      setStatus('重置中（松弛到地面）…');
+      send('reset');
+    };
+
+    const mouse = new THREE.Vector2();
+    function onPointerDown(e) {
+      if (!points || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (e.button !== 0) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(points, false);
+      if (hits.length === 0) return;
+      e.preventDefault();
+      grabbing = true;
+      controls.enabled = false;
+      const idx = hits[0].index;
+      const particleIndex = idx * indexStride;
+      grabWorld.fromBufferAttribute(points.geometry.attributes.position, idx);
+      send('grab', { particle_index: particleIndex });
+      const n = camera.getWorldDirection(new THREE.Vector3()).negate();
+      dragPlane.setFromNormalAndCoplanarPoint(n, grabWorld);
+    }
+
+    let dragRaf = 0;
+    function onPointerMove(e) {
+      if (!grabbing || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (dragRaf) return;
+      dragRaf = requestAnimationFrame(() => {
+        dragRaf = 0;
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        if (raycaster.ray.intersectPlane(dragPlane, dragTarget)) {
+          const s = threeToSim(dragTarget);
+          send('drag', s);
+        }
+      });
+    }
+
+    function onPointerUp() {
+      if (!grabbing) return;
+      grabbing = false;
+      controls.enabled = true;
+      send('release', { free_ticks: 3 });
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+
+    function tick() {
+      requestAnimationFrame(tick);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    tick();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+  </script>
+</body>
+</html>
